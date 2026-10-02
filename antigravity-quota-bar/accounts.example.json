@@ -1,0 +1,12 @@
+[
+  {
+    "email": "user1@example.com",
+    "refresh_token": "1//EXAMPLE_OAUTH_REFRESH_TOKEN_DO_NOT_SHARE",
+    "added_at": "2026-10-01T12:00:00.000000"
+  },
+  {
+    "email": "user2@example.com",
+    "refresh_token": "1//EXAMPLE_OAUTH_REFRESH_TOKEN_DO_NOT_SHARE",
+    "added_at": "2026-10-01T12:05:00.000000"
+  }
+]

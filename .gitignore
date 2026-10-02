@@ -1,0 +1,41 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Environment and credentials
+.env
+*.env
+.env.*
+!.env.example
+
+# Live Quota Bar: User OAuth credentials, local balance caches, and generated dashboards
+antigravity-quota-bar/accounts.json
+antigravity-quota-bar/.quota_cache.json
+antigravity-quota-bar/dashboard.html
+accounts.json
+.quota_cache.json
+dashboard.html
+
+# Token Analytics: User chat history caches, generated dumps
+token_analytics/data/*.json
+!token_analytics/data/.gitkeep
+token_analytics/antigravity_token_analysis.json
+antigravity_token_analysis.json
+token_analytics/agy_quota_watchdog.py
+.agy_quota_state.json
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
