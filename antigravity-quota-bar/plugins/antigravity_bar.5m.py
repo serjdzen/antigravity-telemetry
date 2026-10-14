@@ -13,6 +13,7 @@ Runs every 15 minutes, or on demand via 'Refresh'.
 import os
 import sys
 import socket
+import subprocess
 
 # Prevent any socket or network call from hanging indefinitely
 socket.setdefaulttimeout(8)
@@ -35,6 +36,24 @@ except ImportError:
     sys.exit(0)
 
 
+def trigger_background_token_sync():
+    """
+    Launches background token analytics sync detached from SwiftBar.
+    Ensures active sessions are incrementally cached before they can be deleted from UI.
+    """
+    token_sync_script = os.path.join(os.path.dirname(PROJECT_DIR), "token_analytics", "sync_cache.py")
+    if os.path.exists(token_sync_script):
+        try:
+            subprocess.Popen(
+                [sys.executable, token_sync_script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True
+            )
+        except Exception:
+            pass
+
+
 def get_color_for_pct(pct):
     if pct <= 15:
         return " color=#ff453a"  # Red
@@ -44,6 +63,7 @@ def get_color_for_pct(pct):
 
 
 def main():
+    trigger_background_token_sync()
     accounts_data = check_quota.get_all_quotas_data(force_refresh=True)
 
     if not accounts_data:
@@ -96,6 +116,8 @@ def main():
         email = acc.get("email", "unknown")
         is_active = (email.lower() == (active_email or primary_acc.get("email", "").lower()))
         badge = " (Активен)" if is_active else ""
+        if acc.get("cached_fallback"):
+            badge += " (кэш)"
 
         print(f"{email}{badge} | font=SFPro-Bold size=13 color={'#0284c7' if is_active else '#000000'}")
 

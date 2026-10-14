@@ -1,5 +1,6 @@
 import os
 import json
+import sqlite3
 from datetime import datetime
 from collections import defaultdict
 from tokenizers import Tokenizer
@@ -8,6 +9,32 @@ SYSTEM_PROMPT_ESTIMATE = 3500  # Overhead on each model turn (system prompt, too
 
 def get_tokenizer():
     return Tokenizer.from_pretrained('Qwen/Qwen2.5-7B')
+
+def load_conversation_titles(db_path=None):
+    """
+    Reads actual human-readable conversation titles from Antigravity conversation_summaries.db.
+    Returns: dict mapping conversation_id -> title.
+    """
+    if db_path is None:
+        db_path = os.path.expanduser('~/.gemini/antigravity/conversation_summaries.db')
+    if not os.path.exists(db_path):
+        return {}
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT conversation_id, title, preview FROM conversation_summaries")
+        title_map = {}
+        for cid, t, p in cur.fetchall():
+            t = (t or "").strip()
+            p = (p or "").strip()
+            best = t if t else p
+            if best:
+                first_line = best.split("\n")[0].strip()
+                title_map[cid] = first_line[:120]
+        conn.close()
+        return title_map
+    except Exception:
+        return {}
 
 def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
     """
@@ -55,6 +82,7 @@ def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
         raise FileNotFoundError(f"Brain directory not found at: {brain_dir}")
 
     convo_ids = [d for d in os.listdir(brain_dir) if os.path.isdir(os.path.join(brain_dir, d))]
+    titles_map = load_conversation_titles()
     
     # We will load the tokenizer only if there are sessions to process
     tok = None
@@ -104,6 +132,10 @@ def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
             and cached_entry.get('size') == size
             and 'by_date' in cached_entry
         ):
+            if c_id in titles_map:
+                cached_entry['title'] = titles_map[c_id]
+            elif 'title' not in cached_entry:
+                cached_entry['title'] = cached_entry.get('first_req', '(нет темы)')
             results[c_id] = cached_entry
             cached_sessions += 1
             continue
@@ -183,6 +215,7 @@ def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
 
         entry = {
             'id': c_id,
+            'title': titles_map.get(c_id) or first_req or "(нет темы)",
             'first_req': first_req or "(нет текста запроса)",
             'file_path': target_file,
             'mtime': mtime,
@@ -193,6 +226,16 @@ def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
         results[c_id] = entry
         cache[c_id] = entry
         updated_sessions += 1
+
+    # Retain all cached historical sessions that have since been deleted from disk
+    # to guarantee that historical token consumption and audits remain 100% complete
+    for c_id, cached_entry in cache.items():
+        if c_id not in results:
+            entry_copy = dict(cached_entry)
+            entry_copy['deleted_from_disk'] = True
+            if 'title' not in entry_copy:
+                entry_copy['title'] = entry_copy.get('first_req', '(нет темы)')
+            results[c_id] = entry_copy
 
     # Save cache back
     try:

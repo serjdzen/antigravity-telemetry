@@ -106,9 +106,12 @@ def get_overall_summary(sessions):
 
     sorted_dates = sorted(all_dates)
     tot_unique = tot_user + tot_model + tot_thinking + tot_tool
+    deleted_sessions = sum(1 for s in sessions.values() if s.get('deleted_from_disk'))
 
     return {
         'total_sessions': tot_sessions,
+        'active_sessions': tot_sessions - deleted_sessions,
+        'deleted_sessions': deleted_sessions,
         'active_days': len(all_dates),
         'first_date': sorted_dates[0] if sorted_dates else None,
         'last_date': sorted_dates[-1] if sorted_dates else None,
@@ -141,6 +144,7 @@ def get_top_conversations(sessions, limit=15, sort_by='unique_tok'):
 
         conv_list.append({
             'id': c_id,
+            'title': s_data.get('title') or s_data.get('first_req', '(нет темы)'),
             'start_date': dates[0] if dates else 'unknown',
             'first_req': s_data.get('first_req', '(нет текста)'),
             'user_tok': u,
@@ -149,7 +153,8 @@ def get_top_conversations(sessions, limit=15, sort_by='unique_tok'):
             'tool_tok': tl,
             'unique_tok': uniq,
             'context_tok': ctx,
-            'steps': steps
+            'steps': steps,
+            'deleted_from_disk': s_data.get('deleted_from_disk', False)
         })
 
     conv_list.sort(key=lambda x: x.get(sort_by, 0), reverse=True)

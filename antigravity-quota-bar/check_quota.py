@@ -17,6 +17,7 @@ import os
 import sys
 import json
 import time
+import socket
 import urllib.request
 import urllib.parse
 import webbrowser
@@ -110,7 +111,13 @@ def save_accounts(accounts):
         json.dump(accounts, f, indent=2, ensure_ascii=False)
 
 
-def refresh_access_token(refresh_token):
+def refresh_access_token(refresh_token, retries=1, return_details=False):
+    """
+    Refreshes Google OAuth access token with automatic retry on transient network errors.
+    Returns:
+        access_token (str or None) if return_details is False.
+        tuple (access_token, error_type, error_msg) if return_details is True.
+    """
     token_url = "https://oauth2.googleapis.com/token"
     payload = urllib.parse.urlencode({
         "client_id": CLIENT_ID,
@@ -119,15 +126,53 @@ def refresh_access_token(refresh_token):
         "grant_type": "refresh_token",
     }).encode("utf-8")
 
-    req = urllib.request.Request(token_url, data=payload, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    last_err_type = None
+    last_err_msg = None
 
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data.get("access_token")
-    except Exception as e:
-        return None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(token_url, data=payload, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+        try:
+            with urllib.request.urlopen(req, timeout=7) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                tok = data.get("access_token")
+                if tok:
+                    return (tok, None, None) if return_details else tok
+        except urllib.error.HTTPError as e:
+            err_code = ""
+            err_desc = ""
+            try:
+                err_body = e.read().decode("utf-8")
+                err_json = json.loads(err_body)
+                err_code = err_json.get("error", "")
+                err_desc = err_json.get("error_description", "")
+            except Exception:
+                pass
+
+            if e.code == 400 and ("invalid_grant" in str(err_code) or "invalid_grant" in str(err_desc)):
+                last_err_type = "invalid_grant"
+                last_err_msg = "Требуется повторный вход (токен отозван или устарел)"
+                break  # Fatal: no point in retrying invalid_grant
+            elif e.code in (429, 500, 502, 503, 504):
+                last_err_type = "network_error"
+                last_err_msg = f"Временный сбой Google OAuth (HTTP {e.code})"
+            else:
+                last_err_type = "http_error"
+                last_err_msg = f"Ошибка OAuth (HTTP {e.code}: {err_code or err_desc or 'неизвестная ошибка'})"
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
+            last_err_type = "network_error"
+            last_err_msg = "Таймаут или сбой сети при запросе к Google OAuth"
+        except Exception as e:
+            last_err_type = "other"
+            last_err_msg = f"Ошибка: {str(e)}"
+
+        if attempt < retries:
+            time.sleep(1.0)
+
+    if return_details:
+        return None, last_err_type, (last_err_msg or "Не удалось обновить токен")
+    return None
 
 
 def fetch_account_email(access_token):
@@ -260,12 +305,14 @@ def fetch_account_quota(acc):
     if not rf_token:
         acc_data["status"] = "error"
         acc_data["error"] = "Отсутствует refresh token"
+        acc_data["error_type"] = "config_error"
         return acc_data
 
-    access_token = refresh_access_token(rf_token)
+    access_token, err_type, err_msg = refresh_access_token(rf_token, retries=1, return_details=True)
     if not access_token:
         acc_data["status"] = "error"
-        acc_data["error"] = "Не удалось обновить токен (требуется повторный вход)"
+        acc_data["error"] = err_msg
+        acc_data["error_type"] = err_type
         return acc_data
 
     # 1. Try modern retrieveUserQuotaSummary
@@ -326,6 +373,7 @@ def fetch_account_quota(acc):
         if not quota_data or "models" not in quota_data:
             acc_data["status"] = "error"
             acc_data["error"] = "Пустой ответ от Google Quota API"
+            acc_data["error_type"] = "network_error"
             return acc_data
 
         models = quota_data.get("models", {})
@@ -413,6 +461,28 @@ def get_all_quotas_data(force_refresh=False):
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=min(len(accounts), 8)) as executor:
         results = list(executor.map(fetch_account_quota, accounts))
+
+    # Load previous cache if available for graceful fallback on transient network errors
+    prev_cache = {}
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                c_data = json.load(f)
+                if isinstance(c_data, list):
+                    prev_cache = {item.get("email"): item for item in c_data if item.get("status") == "ok"}
+        except Exception:
+            pass
+
+    # If an individual account hit a transient network error, fall back to its cached quota
+    for i, res in enumerate(results):
+        if res.get("status") == "error" and res.get("error_type") == "network_error":
+            cached_acc = prev_cache.get(res.get("email"))
+            if cached_acc and cached_acc.get("models"):
+                results[i] = {
+                    **cached_acc,
+                    "cached_fallback": True,
+                    "transient_error": res.get("error")
+                }
 
     # Cache successful data
     if any(r.get("status") == "ok" for r in results):
@@ -1476,19 +1546,32 @@ HTML_DASHBOARD_TEMPLATE = """
           <div class="top-sessions-title">
             <span>🏆</span>
             <span>Топ-10 самых ресурсоёмких сессий на этом Mac</span>
-            <span class="top-sessions-badge" id="top-sessions-count-badge">10 сессий</span>
+            <span class="top-sessions-badge" id="top-sessions-count-badge">сессий</span>
           </div>
           <button class="accordion-btn" id="top-sessions-arrow">▼ Развернуть</button>
         </div>
         <div class="top-sessions-content" id="top-sessions-content" style="display: none;">
-          <div class="table-responsive" style="margin-top: 10px;">
+          <!-- Filter Controls for Active vs Deleted -->
+          <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-top: 10px; margin-bottom: 12px;">
+            <div class="filter-group" style="display: flex; align-items: center; gap: 10px;">
+              <span class="filter-label">Диалоги:</span>
+              <div class="period-presets" id="top-sessions-filter-presets">
+                <button class="preset-btn active" onclick="setTopFilter('all')" id="btn-top-all">Все (включая удалённые)</button>
+                <button class="preset-btn" onclick="setTopFilter('active')" id="btn-top-active">Только на диске (активные)</button>
+                <button class="preset-btn" onclick="setTopFilter('deleted')" id="btn-top-deleted">Только удалённые из UI</button>
+              </div>
+            </div>
+            <span style="font-size: 12px; color: #64748b;" id="top-filter-hint">Показано топ-10 сессий</span>
+          </div>
+
+          <div class="table-responsive">
             <table class="data-table">
               <thead>
                 <tr>
-                  <th>Сессия ID</th>
+                  <th>Тема диалога</th>
+                  <th>Статус</th>
                   <th>Дата старта</th>
                   <th class="text-right">Шагов</th>
-                  <th>Первый запрос / Тема</th>
                   <th class="text-right">Уникальных</th>
                   <th class="text-right">Кумулятивный контекст</th>
                 </tr>
@@ -2247,24 +2330,73 @@ HTML_DASHBOARD_TEMPLATE = """
       }).join('');
     }
 
+    let currentTopFilter = 'all';
+    let rawTopConversations = [];
+
+    function setTopFilter(filter) {
+      currentTopFilter = filter;
+      ['all', 'active', 'deleted'].forEach(f => {
+        const btn = document.getElementById(`btn-top-${f}`);
+        if (btn) btn.classList.toggle('active', f === filter);
+      });
+      applyTopFilter();
+    }
+
     function renderTopSessions(topConvos) {
+      rawTopConversations = topConvos || [];
+      applyTopFilter();
+    }
+
+    function applyTopFilter() {
       const tbody = document.getElementById('top-sessions-body');
       const badge = document.getElementById('top-sessions-count-badge');
-      if (badge && topConvos) badge.innerText = `${topConvos.length} сессий`;
+      const hint = document.getElementById('top-filter-hint');
       if (!tbody) return;
 
-      tbody.innerHTML = topConvos.map(c => {
+      let filtered = rawTopConversations;
+      if (currentTopFilter === 'active') {
+        filtered = rawTopConversations.filter(c => !c.deleted_from_disk);
+      } else if (currentTopFilter === 'deleted') {
+        filtered = rawTopConversations.filter(c => c.deleted_from_disk);
+      }
+
+      const displayItems = filtered.slice(0, 10);
+      if (badge) badge.innerText = `${displayItems.length} из ${filtered.length} сессий`;
+      if (hint) {
+        if (currentTopFilter === 'active') {
+          hint.innerText = `Показаны топ-${displayItems.length} самых ресурсоёмких сессий, которые сейчас сохранены на диске`;
+        } else if (currentTopFilter === 'deleted') {
+          hint.innerText = `Показаны топ-${displayItems.length} самых ресурсоёмких сессий из числа удалённых из UI`;
+        } else {
+          hint.innerText = `Показано топ-${displayItems.length} сессий за всё время (включая удалённые)`;
+        }
+      }
+
+      if (!displayItems.length) {
+        tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: #64748b; padding: 24px;">Нет сессий в данной категории</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = displayItems.map(c => {
         const shortId = (c.id || '').substring(0, 8) + '...';
-        const cleanPrompt = (c.first_req || 'Сессия без стартового сообщения').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const displayTitle = (c.title || c.first_req || 'Диалог без темы').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const cleanPrompt = (c.first_req || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const isDeleted = Boolean(c.deleted_from_disk);
+        const statusBadge = isDeleted
+          ? `<span style="display: inline-block; padding: 2px 7px; border-radius: 6px; font-size: 11px; font-weight: 600; background: rgba(248, 113, 113, 0.15); color: #f87171; border: 1px solid rgba(248, 113, 113, 0.3);">Удалён из UI</span>`
+          : `<span style="display: inline-block; padding: 2px 7px; border-radius: 6px; font-size: 11px; font-weight: 600; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3);">Активен</span>`;
 
         return `
           <tr>
-            <td style="color: #38bdf8; font-weight: 600;" title="${c.id}">${shortId}</td>
+            <td style="max-width: 420px;" title="ID: ${c.id}&#10;Стартовый запрос: ${cleanPrompt}">
+              <div style="font-weight: 600; color: #f8fafc; font-size: 13px; line-height: 1.4;">${displayTitle}</div>
+              <div style="font-size: 11px; color: #64748b; font-family: Menlo, Monaco, monospace; margin-top: 3px;">ID: ${shortId}</div>
+            </td>
+            <td>${statusBadge}</td>
             <td>${c.start_date || '-'}</td>
             <td class="text-right">${formatNumberFull(c.steps || 0)}</td>
-            <td class="session-prompt" title="${cleanPrompt}">${cleanPrompt}</td>
             <td class="text-right" style="font-weight: 600; color: #38bdf8;" title="${formatNumberFull(c.unique_tok || 0)}">${formatTokens(c.unique_tok || 0)}</td>
-            <td class="text-right" style="color: #f87171;" title="${formatNumberFull(c.context_tok || 0)}">${formatTokens(c.context_tok || 0)}</td>
+            <td class="text-right" style="color: #f87171; font-weight: 600;" title="${formatNumberFull(c.context_tok || 0)}">${formatTokens(c.context_tok || 0)}</td>
           </tr>
         `;
       }).join('');

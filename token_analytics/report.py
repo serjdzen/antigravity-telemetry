@@ -61,10 +61,14 @@ def main():
     comparisons = compute_period_comparisons(aggregated, summary)
 
     # 1. Overall Summary Banner
+    del_cnt = summary.get('deleted_sessions', 0)
+    act_cnt = summary.get('active_sessions', summary['total_sessions'])
+    del_str = f" (активных: {act_cnt:,}, удалённых из UI: {del_cnt:,})" if del_cnt > 0 else ""
+
     print("--------------------------------------------------------------------------------")
     print("📊 ИТОГОВАЯ СВОДКА ЗА ВСЮ ИСТОРИЮ:")
     print(f"  • Активный период:            {summary['first_date']} — {summary['last_date']} ({summary['active_days']} активных дней)")
-    print(f"  • Всего сессий диалогов:      {summary['total_sessions']:,}")
+    print(f"  • Всего сессий диалогов:      {summary['total_sessions']:,}{del_str}")
     print(f"  • Всего шагов (сообщений):    {summary['tot_steps']:,}")
     print(f"  • Всего обращений к API:      {summary['tot_model_calls']:,} вызовов")
     print(f"  • Входящие токены (User):     {summary['tot_user_tok']:>12,} ({format_tokens(summary['tot_user_tok'])})")
@@ -127,16 +131,20 @@ def main():
         top_convos = get_top_conversations(sessions, limit=args.top)
         top_table = []
         for cv in top_convos:
+            status_str = "Удалён" if cv.get('deleted_from_disk') else "Активен"
+            title_str = (cv.get('title') or cv.get('first_req', '')).replace('\n', ' ')
+            if len(title_str) > 50:
+                title_str = title_str[:47] + "..."
             top_table.append([
-                cv['id'][:8] + "...",
+                title_str,
+                status_str,
                 cv['start_date'],
-                cv['steps'],
-                cv['first_req'],
+                f"{cv['steps']:,}",
                 f"{cv['unique_tok']:,}",
                 f"{cv['context_tok']:,}"
             ])
         print(f"🏆 ТОП-{args.top} САМЫХ БОЛЬШИХ СЕССИЙ:")
-        c_headers = ["ID", "Дата", "Шагов", "Первый запрос / Тема", "Уникальных", "Контекст"]
+        c_headers = ["Тема диалога", "Статус", "Дата", "Шагов", "Уникальных", "Контекст"]
         print(tabulate(top_table, headers=c_headers, tablefmt="github"))
         print("\n")
 
@@ -150,7 +158,7 @@ def main():
         'monthly': comparisons if args.period == 'month' else compute_period_comparisons(aggregate_by_period(sessions, 'month'), summary),
         'weekly': comparisons if args.period == 'week' else compute_period_comparisons(aggregate_by_period(sessions, 'week'), summary),
         'daily': comparisons if args.period == 'day' else compute_period_comparisons(aggregate_by_period(sessions, 'day'), summary),
-        'top_conversations': get_top_conversations(sessions, limit=20)
+        'top_conversations': get_top_conversations(sessions, limit=50)
     }
 
     try:
