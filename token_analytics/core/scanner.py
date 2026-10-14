@@ -10,31 +10,77 @@ SYSTEM_PROMPT_ESTIMATE = 3500  # Overhead on each model turn (system prompt, too
 def get_tokenizer():
     return Tokenizer.from_pretrained('Qwen/Qwen2.5-7B')
 
-def load_conversation_titles(db_path=None):
+import urllib.parse
+
+def load_conversation_metadata(db_path=None):
     """
-    Reads actual human-readable conversation titles from Antigravity conversation_summaries.db.
-    Returns: dict mapping conversation_id -> title.
+    Reads actual human-readable conversation titles and workspace project names
+    from Antigravity conversation_summaries.db.
+    Returns:
+        tuple: (title_map, project_map)
     """
     if db_path is None:
         db_path = os.path.expanduser('~/.gemini/antigravity/conversation_summaries.db')
     if not os.path.exists(db_path):
-        return {}
+        return {}, {}
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
-        cur.execute("SELECT conversation_id, title, preview FROM conversation_summaries")
+        cur.execute("SELECT conversation_id, title, preview, workspace_uris FROM conversation_summaries")
         title_map = {}
-        for cid, t, p in cur.fetchall():
+        project_map = {}
+        for cid, t, p, ws in cur.fetchall():
+            # 1. Human-readable Title
             t = (t or "").strip()
             p = (p or "").strip()
             best = t if t else p
             if best:
                 first_line = best.split("\n")[0].strip()
                 title_map[cid] = first_line[:120]
+
+            # 2. Project Name from Workspace URIs
+            if ws:
+                try:
+                    uris = json.loads(ws)
+                    for u in uris:
+                        unquoted = urllib.parse.unquote(u)
+                        clean_path = unquoted.replace("file://", "").rstrip("/")
+                        bname = os.path.basename(clean_path)
+                        if bname and not bname.startswith("subagent-"):
+                            project_map[cid] = bname
+                            break
+                        elif bname and cid not in project_map:
+                            project_map[cid] = bname
+                except Exception:
+                    pass
         conn.close()
-        return title_map
+        return title_map, project_map
     except Exception:
-        return {}
+        return {}, {}
+
+import re
+
+def infer_project_name(text):
+    """
+    Fallback extractor for project name from conversation title or initial user request.
+    Handles historical sessions where sqlite summary row was deleted.
+    """
+    if not text:
+        return None
+    stopwords = {'из', 'есть', 'в', 'на', 'с', 'по', 'этого', 'нашего', 'этом', 'проекте', 'проекта'}
+    m = re.search(r'проект[ауе]?\s+([A-Za-zА-Яа-я0-9_-]+)', text, re.I)
+    if m:
+        cand = m.group(1).strip()
+        if cand.lower() in stopwords:
+            return None
+        if cand.lower() == 'seo':
+            return 'SEO'
+        if cand.lower() == 'dialoganalytics':
+            return 'DialogAnalytics'
+        if cand.lower() == 'джойтиш':
+            return 'Джойтиш'
+        return cand
+    return None
 
 def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
     """
@@ -82,7 +128,7 @@ def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
         raise FileNotFoundError(f"Brain directory not found at: {brain_dir}")
 
     convo_ids = [d for d in os.listdir(brain_dir) if os.path.isdir(os.path.join(brain_dir, d))]
-    titles_map = load_conversation_titles()
+    titles_map, projects_map = load_conversation_metadata()
     
     # We will load the tokenizer only if there are sessions to process
     tok = None
@@ -136,6 +182,10 @@ def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
                 cached_entry['title'] = titles_map[c_id]
             elif 'title' not in cached_entry:
                 cached_entry['title'] = cached_entry.get('first_req', '(нет темы)')
+            if c_id in projects_map:
+                cached_entry['project'] = projects_map[c_id]
+            elif not cached_entry.get('project') or cached_entry.get('project') == '—':
+                cached_entry['project'] = infer_project_name(cached_entry.get('title')) or infer_project_name(cached_entry.get('first_req')) or '—'
             results[c_id] = cached_entry
             cached_sessions += 1
             continue
@@ -213,9 +263,11 @@ def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
                 by_date[step_date]['tool_tok'] += tl_cnt
                 current_history += tl_cnt
 
+        proj_val = projects_map.get(c_id) or infer_project_name(titles_map.get(c_id)) or infer_project_name(first_req) or '—'
         entry = {
             'id': c_id,
             'title': titles_map.get(c_id) or first_req or "(нет темы)",
+            'project': proj_val,
             'first_req': first_req or "(нет текста запроса)",
             'file_path': target_file,
             'mtime': mtime,
@@ -233,8 +285,16 @@ def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
         if c_id not in results:
             entry_copy = dict(cached_entry)
             entry_copy['deleted_from_disk'] = True
-            if 'title' not in entry_copy:
+            if c_id in titles_map:
+                entry_copy['title'] = titles_map[c_id]
+            elif 'title' not in entry_copy:
                 entry_copy['title'] = entry_copy.get('first_req', '(нет темы)')
+            if c_id in projects_map:
+                entry_copy['project'] = projects_map[c_id]
+            elif not entry_copy.get('project') or entry_copy.get('project') == '—':
+                entry_copy['project'] = infer_project_name(entry_copy.get('title')) or infer_project_name(entry_copy.get('first_req')) or '—'
+            cached_entry['title'] = entry_copy['title']
+            cached_entry['project'] = entry_copy['project']
             results[c_id] = entry_copy
 
     # Save cache back

@@ -1569,6 +1569,7 @@ HTML_DASHBOARD_TEMPLATE = """
               <thead>
                 <tr>
                   <th>Тема диалога</th>
+                  <th>Проект</th>
                   <th>Статус</th>
                   <th>Дата старта</th>
                   <th class="text-right">Шагов</th>
@@ -2373,7 +2374,7 @@ HTML_DASHBOARD_TEMPLATE = """
       }
 
       if (!displayItems.length) {
-        tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: #64748b; padding: 24px;">Нет сессий в данной категории</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: #64748b; padding: 24px;">Нет сессий в данной категории</td></tr>`;
         return;
       }
 
@@ -2381,6 +2382,10 @@ HTML_DASHBOARD_TEMPLATE = """
         const shortId = (c.id || '').substring(0, 8) + '...';
         const displayTitle = (c.title || c.first_req || 'Диалог без темы').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         const cleanPrompt = (c.first_req || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const rawProj = (c.project && c.project !== '—') ? c.project.replace(/</g, '&lt;').replace(/>/g, '&gt;') : '';
+        const projectBadge = rawProj
+          ? `<span style="display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; background: rgba(99, 102, 241, 0.15); color: #a5b4fc; border: 1px solid rgba(99, 102, 241, 0.3); white-space: nowrap;">📁 ${rawProj}</span>`
+          : `<span style="color: #64748b; font-size: 12px;">—</span>`;
         const isDeleted = Boolean(c.deleted_from_disk);
         const statusBadge = isDeleted
           ? `<span style="display: inline-block; padding: 2px 7px; border-radius: 6px; font-size: 11px; font-weight: 600; background: rgba(248, 113, 113, 0.15); color: #f87171; border: 1px solid rgba(248, 113, 113, 0.3);">Удалён из UI</span>`
@@ -2388,10 +2393,11 @@ HTML_DASHBOARD_TEMPLATE = """
 
         return `
           <tr>
-            <td style="max-width: 420px;" title="ID: ${c.id}&#10;Стартовый запрос: ${cleanPrompt}">
-              <div style="font-weight: 600; color: #f8fafc; font-size: 13px; line-height: 1.4;">${displayTitle}</div>
+            <td style="max-width: 280px; min-width: 200px;" title="ID: ${c.id}&#10;Тема: ${displayTitle}&#10;Стартовый запрос: ${cleanPrompt}">
+              <div style="font-weight: 600; color: #f8fafc; font-size: 13px; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word;">${displayTitle}</div>
               <div style="font-size: 11px; color: #64748b; font-family: Menlo, Monaco, monospace; margin-top: 3px;">ID: ${shortId}</div>
             </td>
+            <td>${projectBadge}</td>
             <td>${statusBadge}</td>
             <td>${c.start_date || '-'}</td>
             <td class="text-right">${formatNumberFull(c.steps || 0)}</td>

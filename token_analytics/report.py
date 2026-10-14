@@ -133,10 +133,14 @@ def main():
         for cv in top_convos:
             status_str = "Удалён" if cv.get('deleted_from_disk') else "Активен"
             title_str = (cv.get('title') or cv.get('first_req', '')).replace('\n', ' ')
-            if len(title_str) > 50:
-                title_str = title_str[:47] + "..."
+            if len(title_str) > 42:
+                title_str = title_str[:39] + "..."
+            proj_str = cv.get('project', '—')
+            if len(proj_str) > 20:
+                proj_str = proj_str[:18] + ".."
             top_table.append([
                 title_str,
+                proj_str,
                 status_str,
                 cv['start_date'],
                 f"{cv['steps']:,}",
@@ -144,7 +148,7 @@ def main():
                 f"{cv['context_tok']:,}"
             ])
         print(f"🏆 ТОП-{args.top} САМЫХ БОЛЬШИХ СЕССИЙ:")
-        c_headers = ["Тема диалога", "Статус", "Дата", "Шагов", "Уникальных", "Контекст"]
+        c_headers = ["Тема диалога", "Проект", "Статус", "Дата", "Шагов", "Уникальных", "Контекст"]
         print(tabulate(top_table, headers=c_headers, tablefmt="github"))
         print("\n")
 

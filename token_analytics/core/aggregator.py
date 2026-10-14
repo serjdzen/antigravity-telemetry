@@ -145,6 +145,7 @@ def get_top_conversations(sessions, limit=15, sort_by='unique_tok'):
         conv_list.append({
             'id': c_id,
             'title': s_data.get('title') or s_data.get('first_req', '(нет темы)'),
+            'project': s_data.get('project', '—'),
             'start_date': dates[0] if dates else 'unknown',
             'first_req': s_data.get('first_req', '(нет текста)'),
             'user_tok': u,
