@@ -547,7 +547,7 @@ def parse_and_display_quota(account_email, data_or_acc):
             w_reset = m.get("weekly_reset", "готов")
             w_frac = m.get("weekly_fraction", 1.0)
 
-            is_lockout = (w_pct <= 15 and "д" in str(w_reset)) or "кулдаун" in str(w_reset).lower() or (m.get("percentage") == 0 and "д" in str(reset_5h))
+            is_lockout = (w_pct == 0) or "кулдаун" in str(w_reset).lower() or (m.get("percentage") == 0 and "д" in str(reset_5h))
             if is_lockout:
                 w_pct = 0
                 w_frac = 0.0
@@ -1678,7 +1678,7 @@ HTML_DASHBOARD_TEMPLATE = """
             const rawWreset = String(m.weekly_reset || 'готов');
             const isLockout = Boolean(
               m.is_lockout ||
-              (rawWpct <= 15 && rawWreset.includes('д')) ||
+              rawWpct === 0 ||
               rawWreset.toLowerCase().includes('кулдаун') ||
               (pct5h === 0 && String(reset5h).includes('д'))
             );

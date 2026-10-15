@@ -152,7 +152,7 @@ def main():
                 w_frac = model.get("weekly_fraction", 1.0)
 
                 # If in weekly cooldown/lockout, display as 0% with empty progress bar
-                is_lockout = (w_pct <= 15 and "д" in str(w_reset)) or "кулдаун" in str(w_reset).lower() or (m_pct == 0 and "д" in str(m_reset))
+                is_lockout = (w_pct == 0) or "кулдаун" in str(w_reset).lower() or (m_pct == 0 and "д" in str(m_reset))
                 if is_lockout:
                     w_pct = 0
                     w_frac = 0.0
