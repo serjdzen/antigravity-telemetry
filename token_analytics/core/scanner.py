@@ -177,6 +177,7 @@ def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
             and cached_entry.get('mtime') == mtime
             and cached_entry.get('size') == size
             and 'by_date' in cached_entry
+            and any('user_prompts' in m for m in cached_entry.get('by_date', {}).values())
         ):
             if c_id in titles_map:
                 cached_entry['title'] = titles_map[c_id]
@@ -293,8 +294,15 @@ def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
                 entry_copy['project'] = projects_map[c_id]
             elif not entry_copy.get('project') or entry_copy.get('project') == '—':
                 entry_copy['project'] = infer_project_name(entry_copy.get('title')) or infer_project_name(entry_copy.get('first_req')) or '—'
+            
+            # Ensure user_prompts exists in by_date metrics
+            for d_metrics in entry_copy.get('by_date', {}).values():
+                if 'user_prompts' not in d_metrics:
+                    d_metrics['user_prompts'] = max(1, round(d_metrics.get('user_tok', 0) / 250))
+            
             cached_entry['title'] = entry_copy['title']
             cached_entry['project'] = entry_copy['project']
+            cached_entry['by_date'] = entry_copy['by_date']
             results[c_id] = entry_copy
 
     # Save cache back

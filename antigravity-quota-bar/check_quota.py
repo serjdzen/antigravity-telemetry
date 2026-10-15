@@ -1545,12 +1545,12 @@ HTML_DASHBOARD_TEMPLATE = """
         <div class="top-sessions-header" onclick="toggleTopSessions()">
           <div class="top-sessions-title">
             <span>🏆</span>
-            <span>Топ-10 самых ресурсоёмких сессий на этом Mac</span>
+            <span>Топ-20 самых ресурсоёмких сессий на этом Mac</span>
             <span class="top-sessions-badge" id="top-sessions-count-badge">сессий</span>
           </div>
-          <button class="accordion-btn" id="top-sessions-arrow">▼ Развернуть</button>
+          <button class="accordion-btn" id="top-sessions-arrow">▲ Свернуть</button>
         </div>
-        <div class="top-sessions-content" id="top-sessions-content" style="display: none;">
+        <div class="top-sessions-content" id="top-sessions-content" style="display: block;">
           <!-- Filter Controls for Active vs Deleted -->
           <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-top: 10px; margin-bottom: 12px;">
             <div class="filter-group" style="display: flex; align-items: center; gap: 10px;">
@@ -1561,7 +1561,7 @@ HTML_DASHBOARD_TEMPLATE = """
                 <button class="preset-btn" onclick="setTopFilter('deleted')" id="btn-top-deleted">Только удалённые из UI</button>
               </div>
             </div>
-            <span style="font-size: 12px; color: #64748b;" id="top-filter-hint">Показано топ-10 сессий</span>
+            <span style="font-size: 12px; color: #64748b;" id="top-filter-hint">Показано топ-20 сессий</span>
           </div>
 
           <div class="table-responsive">
@@ -1572,6 +1572,7 @@ HTML_DASHBOARD_TEMPLATE = """
                   <th>Проект</th>
                   <th>Статус</th>
                   <th>Дата старта</th>
+                  <th class="text-right">Запросов</th>
                   <th class="text-right">Шагов</th>
                   <th class="text-right">Уникальных</th>
                   <th class="text-right">Кумулятивный контекст</th>
@@ -2361,7 +2362,7 @@ HTML_DASHBOARD_TEMPLATE = """
         filtered = rawTopConversations.filter(c => c.deleted_from_disk);
       }
 
-      const displayItems = filtered.slice(0, 10);
+      const displayItems = filtered.slice(0, 20);
       if (badge) badge.innerText = `${displayItems.length} из ${filtered.length} сессий`;
       if (hint) {
         if (currentTopFilter === 'active') {
@@ -2374,7 +2375,7 @@ HTML_DASHBOARD_TEMPLATE = """
       }
 
       if (!displayItems.length) {
-        tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: #64748b; padding: 24px;">Нет сессий в данной категории</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" style="text-align: center; color: #64748b; padding: 24px;">Нет сессий в данной категории</td></tr>`;
         return;
       }
 
@@ -2400,6 +2401,7 @@ HTML_DASHBOARD_TEMPLATE = """
             <td>${projectBadge}</td>
             <td>${statusBadge}</td>
             <td>${c.start_date || '-'}</td>
+            <td class="text-right" style="color: #fb7185; font-weight: 600;" title="Запросов пользователя: ${c.user_prompts || 0}">${formatNumberFull(c.user_prompts || 0)}</td>
             <td class="text-right">${formatNumberFull(c.steps || 0)}</td>
             <td class="text-right" style="font-weight: 600; color: #38bdf8;" title="${formatNumberFull(c.unique_tok || 0)}">${formatTokens(c.unique_tok || 0)}</td>
             <td class="text-right" style="color: #f87171; font-weight: 600;" title="${formatNumberFull(c.context_tok || 0)}">${formatTokens(c.context_tok || 0)}</td>

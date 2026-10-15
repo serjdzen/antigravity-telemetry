@@ -41,8 +41,8 @@ def main():
                         help="Limit output rows (e.g. last 14 days)")
     parser.add_argument('--refresh', action='store_true',
                         help="Force full re-scan of brain/ bypassing the incremental cache")
-    parser.add_argument('--top', type=int, default=10,
-                        help="Display top N largest sessions (default: 10)")
+    parser.add_argument('--top', type=int, default=20,
+                        help="Display top N largest sessions (default: 20)")
     parser.add_argument('--json-out', type=str, default=None,
                         help="Output path for JSON report (default: token_analytics/antigravity_token_analysis.json)")
 
@@ -143,12 +143,13 @@ def main():
                 proj_str,
                 status_str,
                 cv['start_date'],
+                f"{cv.get('user_prompts', 0):,}",
                 f"{cv['steps']:,}",
                 f"{cv['unique_tok']:,}",
                 f"{cv['context_tok']:,}"
             ])
         print(f"🏆 ТОП-{args.top} САМЫХ БОЛЬШИХ СЕССИЙ:")
-        c_headers = ["Тема диалога", "Проект", "Статус", "Дата", "Шагов", "Уникальных", "Контекст"]
+        c_headers = ["Тема диалога", "Проект", "Статус", "Дата", "Запросов", "Шагов", "Уникальных", "Контекст"]
         print(tabulate(top_table, headers=c_headers, tablefmt="github"))
         print("\n")
 

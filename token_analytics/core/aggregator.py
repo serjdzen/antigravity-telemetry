@@ -140,6 +140,7 @@ def get_top_conversations(sessions, limit=15, sort_by='unique_tok'):
         tl = sum(m.get('tool_tok', 0) for m in by_date.values())
         ctx = sum(m.get('context_tok', 0) for m in by_date.values())
         steps = sum(m.get('steps', 0) for m in by_date.values())
+        prompts = sum(m.get('user_prompts', 0) for m in by_date.values())
         uniq = u + m_tok + th + tl
 
         conv_list.append({
@@ -155,6 +156,7 @@ def get_top_conversations(sessions, limit=15, sort_by='unique_tok'):
             'unique_tok': uniq,
             'context_tok': ctx,
             'steps': steps,
+            'user_prompts': prompts,
             'deleted_from_disk': s_data.get('deleted_from_disk', False)
         })
 
