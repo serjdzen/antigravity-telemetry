@@ -1350,6 +1350,30 @@ HTML_DASHBOARD_TEMPLATE = """
     .growth-pos { color: #34d399; font-weight: 600; }
     .growth-neg { color: #94a3b8; }
     .growth-high { color: #f87171; font-weight: 600; }
+    .topic-cell {
+      white-space: normal !important;
+      min-width: 280px;
+      max-width: 440px;
+    }
+    .topic-title {
+      font-weight: 600;
+      color: #f8fafc;
+      font-size: 13px;
+      line-height: 1.4;
+      white-space: normal !important;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      word-break: break-word;
+    }
+    .topic-id {
+      font-size: 11px;
+      color: #64748b;
+      font-family: Menlo, Monaco, monospace;
+      margin-top: 4px;
+      white-space: nowrap;
+    }
 
     /* Top Sessions Box */
     .top-sessions-box {
@@ -2394,9 +2418,9 @@ HTML_DASHBOARD_TEMPLATE = """
 
         return `
           <tr>
-            <td style="max-width: 280px; min-width: 200px;" title="ID: ${c.id}&#10;Тема: ${displayTitle}&#10;Стартовый запрос: ${cleanPrompt}">
-              <div style="font-weight: 600; color: #f8fafc; font-size: 13px; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word;">${displayTitle}</div>
-              <div style="font-size: 11px; color: #64748b; font-family: Menlo, Monaco, monospace; margin-top: 3px;">ID: ${shortId}</div>
+            <td class="topic-cell" title="ID: ${c.id}&#10;Тема: ${displayTitle}&#10;Стартовый запрос: ${cleanPrompt}">
+              <div class="topic-title">${displayTitle}</div>
+              <div class="topic-id">ID: ${shortId}</div>
             </td>
             <td>${projectBadge}</td>
             <td>${statusBadge}</td>

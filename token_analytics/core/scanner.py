@@ -36,7 +36,7 @@ def load_conversation_metadata(db_path=None):
             best = t if t else p
             if best:
                 first_line = best.split("\n")[0].strip()
-                title_map[cid] = first_line[:120]
+                title_map[cid] = first_line[:200]
 
             # 2. Project Name from Workspace URIs
             if ws:
@@ -244,7 +244,7 @@ def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
                 if not first_req and content:
                     clean = content.replace('<USER_REQUEST>', '').replace('</USER_REQUEST>', '').strip()
                     first_line = clean.split('\n')[0].strip()
-                    first_req = first_line[:70]
+                    first_req = first_line[:200]
 
             elif src == 'MODEL' and stype == 'PLANNER_RESPONSE':
                 m_cnt = count_tok(content)
