@@ -55,6 +55,7 @@ REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}/oauth-callback"
 DASHBOARD_PORT = 51122
 
 ENDPOINTS = [
+    "https://daily-cloudcode-pa.googleapis.com",
     "https://cloudcode-pa.googleapis.com",
 ]
 
@@ -196,7 +197,7 @@ def query_quota_summary(access_token):
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/1.18.3 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36",
+        "User-Agent": "antigravity/2.23.1 darwin/arm64",
         "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
         "Client-Metadata": '{"ideType":"ANTIGRAVITY","platform":"DARWIN_ARM64","pluginType":"GEMINI"}',
     }
@@ -210,7 +211,7 @@ def query_quota_summary(access_token):
                 headers=headers,
                 method="POST"
             )
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=8) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode("utf-8"))
                     p = data.get("cloudaicompanionProject")
@@ -220,18 +221,19 @@ def query_quota_summary(access_token):
         except Exception:
             pass
 
-    project_candidates = discovered_projects + ["rising-fact-p41fc", "aicode-consumers"]
+    project_candidates = [""] + discovered_projects + ["rising-fact-p41fc", "aicode-consumers"]
 
     for base_url in ENDPOINTS:
         for proj in project_candidates:
             try:
+                body = json.dumps({"project": proj}).encode("utf-8") if proj else b"{}"
                 req = urllib.request.Request(
                     f"{base_url}/v1internal:retrieveUserQuotaSummary",
-                    data=json.dumps({"project": proj}).encode("utf-8"),
+                    data=body,
                     headers=headers,
                     method="POST"
                 )
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with urllib.request.urlopen(req, timeout=8) as resp:
                     if resp.status == 200:
                         data = json.loads(resp.read().decode("utf-8"))
                         if data and ("groups" in data or "quota_groups" in data or "quotaGroups" in data):
@@ -245,7 +247,7 @@ def query_quota(access_token, project_id="rising-fact-p41fc"):
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Antigravity/1.18.3 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36",
+        "User-Agent": "antigravity/2.23.1 darwin/arm64",
         "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
         "Client-Metadata": '{"ideType":"ANTIGRAVITY","platform":"MACOS","pluginType":"GEMINI"}',
     }
