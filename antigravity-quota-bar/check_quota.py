@@ -99,7 +99,11 @@ def get_active_antigravity_account():
             try:
                 with open(storage_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    email = data.get("jetski.onboarding.lastLoginUsername")
+                    email = (
+                        data.get("agy.onboarding.lastLoginUsername")
+                        or data.get("jetski.onboarding.lastLoginUsername")
+                        or data.get("antigravity.onboarding.lastLoginUsername")
+                    )
                     if email and "@" in email:
                         return email.strip().lower()
             except Exception:

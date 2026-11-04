@@ -114,7 +114,7 @@ def main():
     # Dropdown content (crisp dark text for macOS Light & Dark Mode)
     for acc in accounts_data:
         email = acc.get("email", "unknown")
-        is_active = (email.lower() == (active_email or primary_acc.get("email", "").lower()))
+        is_active = bool(active_email and email.lower() == active_email.lower())
         badge = " (Активен)" if is_active else ""
         if acc.get("cached_fallback"):
             badge += " (кэш)"
