@@ -64,10 +64,10 @@ antigravity-quota-bar/
 ### 2. Запрос квот через внутренний Cloud Code API
 При каждом опросе ядро выполняет 3 шага:
 1. **Обновление токена доступа (`access_token`):** Запрос к `https://oauth2.googleapis.com/token` через сохраненный `refresh_token`.
-2. **Определение проекта (`loadCodeAssist`):**  
-   Отправляет `POST https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist` с метаданными Antigravity IDE (`DARWIN_ARM64`, `GEMINI`). Сервер возвращает идентификатор проекта пользователя (`cloudaicompanionProject`, например `aicode-consumers`).
+2. **Определение проекта и тарифа (`loadCodeAssist`):**  
+   Отправляет запрос к `daily-cloudcode-pa.googleapis.com` (с резервом на `cloudcode-pa.googleapis.com`) с метаданными Antigravity IDE (`DARWIN_ARM64`, `GEMINI`).
 3. **Получение структуры лимитов (`retrieveUserQuotaSummary`):**  
-   Отправляет `POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` с телом `{"project": "<project_id>"}`.  
+   Запрашивает актуальные квоты (передавая пустой проект `{}` для прямого запроса Google AI Pro тарифа).  
    Сервер возвращает сгруппированные бакеты:
    - `Five Hour Limit Remaining` -> процент и `resetTime`.
    - `Weekly Limit Remaining` -> процент и `resetTime`.
@@ -78,7 +78,7 @@ antigravity-quota-bar/
 ```text
 ~/Library/Application Support/Antigravity/app_storage.json
 ```
-Из ключа `jetski.onboarding.lastLoginUsername` извлекается email пользователя, под которым прямо сейчас открыта среда разработки. Если пользователь переключает профиль в Antigravity — плагин мгновенно узнаёт об этом, ставит его на первое место и показывает его баланс в верхней панели.
+Из ключа `agy.onboarding.lastLoginUsername` (и резервного `jetski.onboarding.lastLoginUsername`) извлекается email пользователя, под которым прямо сейчас открыта среда разработки. Если пользователь переключает профиль в Antigravity — плагин мгновенно узнаёт об этом, ставит его на первое место и показывает его баланс в верхней панели.
 
 ---
 
