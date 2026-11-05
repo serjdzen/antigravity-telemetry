@@ -18,6 +18,8 @@ import sys
 import json
 import time
 import socket
+import subprocess
+import re
 import urllib.request
 import urllib.parse
 import webbrowser
@@ -247,6 +249,91 @@ def query_quota_summary(access_token):
     return None
 
 
+_CACHED_LS_PORT = None
+_CACHED_LS_TOKEN = None
+
+def discover_local_language_server(force=False):
+    """
+    Auto-discovers the local Antigravity Language Server port and CSRF token.
+    Fast (sub-millisecond) local query with 0 network latency.
+    """
+    global _CACHED_LS_PORT, _CACHED_LS_TOKEN
+    if not force and _CACHED_LS_PORT and _CACHED_LS_TOKEN:
+        try:
+            url = f"http://127.0.0.1:{_CACHED_LS_PORT}/exa.language_server_pb.LanguageServerService/GetStatus"
+            req = urllib.request.Request(
+                url,
+                data=b"{}",
+                headers={"Content-Type": "application/json", "x-codeium-csrf-token": _CACHED_LS_TOKEN},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=0.3) as resp:
+                if resp.status == 200:
+                    return _CACHED_LS_PORT, _CACHED_LS_TOKEN
+        except Exception:
+            _CACHED_LS_PORT = None
+            _CACHED_LS_TOKEN = None
+
+    try:
+        # 1. Get csrf_token from ps
+        ps_out = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=1.5).stdout
+        m = re.search(r"language_server.*--csrf_token\s+([a-f0-9-]+)", ps_out)
+        if not m:
+            return None, None
+        csrf_token = m.group(1)
+
+        # 2. Get listening ports of language_server
+        lsof_out = subprocess.run(["lsof", "-nP", "-a", "-c", "language_server", "-iTCP", "-sTCP:LISTEN"], capture_output=True, text=True, timeout=1.5).stdout
+        ports = re.findall(r":(\d+)\s+\(LISTEN\)", lsof_out)
+        for p in ports:
+            try:
+                url = f"http://127.0.0.1:{p}/exa.language_server_pb.LanguageServerService/GetStatus"
+                req = urllib.request.Request(
+                    url,
+                    data=b"{}",
+                    headers={"Content-Type": "application/json", "x-codeium-csrf-token": csrf_token},
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=0.4) as resp:
+                    if resp.status == 200:
+                        _CACHED_LS_PORT = int(p)
+                        _CACHED_LS_TOKEN = csrf_token
+                        return _CACHED_LS_PORT, _CACHED_LS_TOKEN
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None, None
+
+
+def query_local_quota_summary():
+    """
+    Queries local Antigravity Language Server for quota summary (including Gemini 4 Argon).
+    Returns list of quota groups or None.
+    """
+    port, token = discover_local_language_server()
+    if not port or not token:
+        return None
+    try:
+        url = f"http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
+        req = urllib.request.Request(
+            url,
+            data=b"{}",
+            headers={"Content-Type": "application/json", "x-codeium-csrf-token": token},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=0.8) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                resp_obj = data.get("response", data)
+                groups = resp_obj.get("groups") or resp_obj.get("quota_groups") or resp_obj.get("quotaGroups")
+                if groups:
+                    return groups
+    except Exception:
+        pass
+    return None
+
+
 def query_quota(access_token, project_id="rising-fact-p41fc"):
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -298,6 +385,71 @@ def format_reset_time(iso_time_str):
         return iso_time_str
 
 
+def parse_quota_groups(groups):
+    """
+    Parses structured quota groups into models list:
+    - Gemini Models (excludes argon to avoid name collisions)
+    - Claude and GPT models
+    - Gemini 4 Argon (weekly pool)
+    """
+    models = []
+
+    def parse_group(target_keywords, model_name, pool_id, icon, exclude_keywords=None):
+        for g in groups:
+            g_name = (g.get("displayName") or g.get("display_name") or g.get("name") or "").lower()
+            if any(kw in g_name for kw in target_keywords):
+                if exclude_keywords and any(ex in g_name for ex in exclude_keywords):
+                    continue
+                buckets = g.get("buckets") or []
+                five_h_frac = None
+                five_h_reset = None
+                week_frac = None
+                week_reset = None
+                for b in buckets:
+                    b_name = (b.get("displayName") or b.get("display_name") or b.get("name") or "").lower()
+                    rem = b.get("remaining") if isinstance(b.get("remaining"), dict) else b
+                    frac = rem.get("remainingFraction") if "remainingFraction" in rem else rem.get("remaining_fraction")
+                    r_time = rem.get("resetTime") or rem.get("reset_time")
+                    if "week" in b_name or "7" in b_name:
+                        week_frac = frac
+                        week_reset = r_time
+                    elif "five" in b_name or "5" in b_name or "hour" in b_name or "session" in b_name:
+                        five_h_frac = frac
+                        five_h_reset = r_time
+
+                has_5h = five_h_frac is not None
+                has_weekly = week_frac is not None
+
+                return {
+                    "name": model_name,
+                    "pool_id": pool_id,
+                    "icon": icon,
+                    "has_5h": has_5h,
+                    "has_weekly": has_weekly,
+                    "fraction": five_h_frac if has_5h else (week_frac if week_frac is not None else 1.0),
+                    "percentage": int(round(five_h_frac * 100)) if has_5h else (int(round(week_frac * 100)) if week_frac is not None else 100),
+                    "reset": format_reset_time(five_h_reset) if has_5h else format_reset_time(week_reset),
+                    "weekly_fraction": week_frac if week_frac is not None else 1.0,
+                    "weekly_percentage": int(round(week_frac * 100)) if week_frac is not None else 100,
+                    "weekly_reset": format_reset_time(week_reset) if week_reset else "готов",
+                }
+        return None
+
+    g_m = parse_group(["gemini"], "Gemini", "gemini", "✨", exclude_keywords=["argon"])
+    if g_m:
+        models.append(g_m)
+
+    c_m = parse_group(["claude", "gpt"], "Claude", "claude", "🧠")
+    if c_m:
+        models.append(c_m)
+
+    a_m = parse_group(["argon"], "Gemini 4 Argon", "argon", "⚡")
+    if a_m:
+        models.append(a_m)
+
+    return models
+
+
 def fetch_account_quota(acc):
     email = acc.get("email", "unknown")
     rf_token = acc.get("refresh_token")
@@ -308,6 +460,20 @@ def fetch_account_quota(acc):
         "error": None
     }
 
+    # 0. Check if this is the active account in Antigravity IDE
+    active_email = get_active_antigravity_account()
+    is_active = bool(active_email and email.strip().lower() == active_email.strip().lower())
+
+    if is_active:
+        # Fast local query via Language Server (sub-millisecond, returns Gemini, Claude, and Gemini 4 Argon)
+        local_groups = query_local_quota_summary()
+        if local_groups:
+            parsed_models = parse_quota_groups(local_groups)
+            if parsed_models:
+                acc_data["models"] = parsed_models
+                return acc_data
+
+    # 1. Fallback / Standard query via Google Cloud Code API
     if not rf_token:
         acc_data["status"] = "error"
         acc_data["error"] = "Отсутствует refresh token"
@@ -321,57 +487,14 @@ def fetch_account_quota(acc):
         acc_data["error_type"] = err_type
         return acc_data
 
-    # 1. Try modern retrieveUserQuotaSummary
+    # 2. Try modern retrieveUserQuotaSummary
     summary_data = query_quota_summary(access_token)
     if summary_data:
-        groups = summary_data.get("groups") or summary_data.get("quota_groups") or summary_data.get("quotaGroups") or []
-
-        def parse_group(target_keywords, model_name, pool_id, icon):
-            for g in groups:
-                g_name = (g.get("displayName") or g.get("display_name") or g.get("name") or "").lower()
-                if any(kw in g_name for kw in target_keywords):
-                    buckets = g.get("buckets") or []
-                    five_h_frac = None
-                    five_h_reset = None
-                    week_frac = None
-                    week_reset = None
-                    for b in buckets:
-                        b_name = (b.get("displayName") or b.get("display_name") or b.get("name") or "").lower()
-                        rem = b.get("remaining") if isinstance(b.get("remaining"), dict) else b
-                        frac = rem.get("remainingFraction") if "remainingFraction" in rem else rem.get("remaining_fraction")
-                        r_time = rem.get("resetTime") or rem.get("reset_time")
-                        if "week" in b_name or "7" in b_name:
-                            week_frac = frac
-                            week_reset = r_time
-                        elif "five" in b_name or "5" in b_name or "hour" in b_name or "session" in b_name:
-                            five_h_frac = frac
-                            five_h_reset = r_time
-
-                    if five_h_frac is None:
-                        five_h_frac = 1.0
-                    if week_frac is None:
-                        week_frac = 1.0
-
-                    return {
-                        "name": model_name,
-                        "pool_id": pool_id,
-                        "fraction": five_h_frac,
-                        "percentage": int(round(five_h_frac * 100)),
-                        "reset": format_reset_time(five_h_reset),
-                        "weekly_fraction": week_frac,
-                        "weekly_percentage": int(round(week_frac * 100)),
-                        "weekly_reset": format_reset_time(week_reset),
-                        "icon": icon
-                    }
-            return None
-
-        g_m = parse_group(["gemini"], "Gemini", "gemini", "✨")
-        if g_m:
-            acc_data["models"].append(g_m)
-
-        c_m = parse_group(["claude", "gpt"], "Claude", "claude", "🧠")
-        if c_m:
-            acc_data["models"].append(c_m)
+        groups = summary_data.get("groups") or summary_data.get("quota_groups") or summary_data.get("quotaGroups")
+        if not groups and "response" in summary_data:
+            groups = summary_data["response"].get("groups", [])
+        if groups:
+            acc_data["models"] = parse_quota_groups(groups)
 
     # 2. Fallback to fetchAvailableModels if summary returned nothing
     if not acc_data["models"]:
@@ -546,6 +669,15 @@ def parse_and_display_quota(account_email, data_or_acc):
         for m in data_or_acc.get("models", []):
             if m.get("pool_id") in ("image", "claude") or "claude" in m.get("name", "").lower():
                 continue
+            is_argon = m.get("pool_id") == "argon" or "argon" in m.get("name", "").lower()
+            if is_argon:
+                w_pct = m.get("weekly_percentage", 100)
+                w_reset = m.get("weekly_reset", "готов")
+                w_frac = m.get("weekly_fraction", 1.0)
+                bar_w = render_progress_bar(w_frac, width=5)
+                print(f"  ⚡ Argon 7дн: {bar_w}  ({w_reset})")
+                continue
+
             bar_5h = render_progress_bar(m.get("fraction", 1.0), width=5)
             reset_5h = m.get("reset", "готов")
 
@@ -946,6 +1078,9 @@ HTML_DASHBOARD_TEMPLATE = """
       grid-template-columns: 1fr 1fr;
       gap: 12px;
       align-items: center;
+    }
+    .pools-grid.pools-grid-single {
+      grid-template-columns: 1fr;
     }
     .pool-col {
       display: flex;
@@ -1695,6 +1830,8 @@ HTML_DASHBOARD_TEMPLATE = """
           modelsHtml = `<div style="color: #f87171; font-size: 14px; padding: 10px 0;">⚠️ ${acc.error}</div>`;
         } else {
           modelsHtml = (acc.models || []).map(m => {
+            const has5h = m.has_5h !== false && m.pool_id !== 'argon';
+
             // 1. 5-hour session pool
             const pct5h = Number(m.percentage ?? 100);
             const reset5h = m.reset || 'готов';
@@ -1710,7 +1847,7 @@ HTML_DASHBOARD_TEMPLATE = """
               m.is_lockout ||
               rawWpct === 0 ||
               rawWreset.toLowerCase().includes('кулдаун') ||
-              (pct5h === 0 && String(reset5h).includes('д'))
+              (has5h && pct5h === 0 && String(reset5h).includes('д'))
             );
 
             if (isLockout) {
@@ -1737,7 +1874,7 @@ HTML_DASHBOARD_TEMPLATE = """
               pctColor7d = 'color: #fbbf24;';
             }
 
-            const modelIcon = m.icon || (m.name.toLowerCase().includes('claude') ? '🧠' : '✨');
+            const modelIcon = m.icon || (m.pool_id === 'argon' ? '⚡' : (m.name.toLowerCase().includes('claude') ? '🧠' : '✨'));
 
             return `
               <div class="model-row">
@@ -1748,7 +1885,8 @@ HTML_DASHBOARD_TEMPLATE = """
                   </div>
                 </div>
 
-                <div class="pools-grid">
+                <div class="pools-grid ${has5h ? '' : 'pools-grid-single'}">
+                  ${has5h ? `
                   <!-- 5h Session Quota -->
                   <div class="pool-col">
                     <div class="pool-header">
@@ -1762,6 +1900,7 @@ HTML_DASHBOARD_TEMPLATE = """
                       <div class="progress-fill ${color5h}" style="width: ${pct5h}%;"></div>
                     </div>
                   </div>
+                  ` : ''}
 
                   <!-- 7d Weekly Quota -->
                   <div class="pool-col">

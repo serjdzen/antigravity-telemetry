@@ -125,26 +125,29 @@ def main():
             print(f"   ⚠️ {acc.get('error')} | color=#dc2626 size=12 trim=false")
         else:
             for model in acc.get("models", []):
-                # Only show Gemini (skip Claude and image pools)
+                # Only show Gemini and Argon (skip Claude and image pools)
                 if model.get("pool_id") in ("image", "claude") or "claude" in model.get("name", "").lower():
                     continue
 
-                # 1. 5-hour quota row
-                m_pct = model.get("percentage", 100)
-                m_reset = model.get("reset", "готов")
-                m_frac = model.get("fraction", 1.0)
-                filled_5h = int(round(m_frac * 8))
-                bar_5h = "█" * filled_5h + "░" * (8 - filled_5h)
+                is_argon = model.get("pool_id") == "argon" or "argon" in model.get("name", "").lower()
 
-                if m_pct <= 15:
-                    c_5h = " color=#dc2626"
-                elif m_pct <= 35:
-                    c_5h = " color=#d97706"
-                else:
-                    c_5h = " color=#000000"
+                # 1. 5-hour quota row (only for models with 5h session pool)
+                if not is_argon and model.get("has_5h", True):
+                    m_pct = model.get("percentage", 100)
+                    m_reset = model.get("reset", "готов")
+                    m_frac = model.get("fraction", 1.0)
+                    filled_5h = int(round(m_frac * 8))
+                    bar_5h = "█" * filled_5h + "░" * (8 - filled_5h)
 
-                row_5h = f"   5ч:  [{bar_5h}] {m_pct:>3}%  ({m_reset})"
-                print(f"{row_5h} | font=Menlo size=12 trim=false{c_5h}")
+                    if m_pct <= 15:
+                        c_5h = " color=#dc2626"
+                    elif m_pct <= 35:
+                        c_5h = " color=#d97706"
+                    else:
+                        c_5h = " color=#000000"
+
+                    row_5h = f"   5ч:  [{bar_5h}] {m_pct:>3}%  ({m_reset})"
+                    print(f"{row_5h} | font=Menlo size=12 trim=false{c_5h}")
 
                 # 2. 7-day quota row
                 w_pct = model.get("weekly_percentage", 100)
@@ -152,10 +155,11 @@ def main():
                 w_frac = model.get("weekly_fraction", 1.0)
 
                 # If in weekly cooldown/lockout, display as 0% with empty progress bar
-                is_lockout = (w_pct == 0) or "кулдаун" in str(w_reset).lower() or (m_pct == 0 and "д" in str(m_reset))
+                is_lockout = (w_pct == 0) or "кулдаун" in str(w_reset).lower() or (model.get("percentage") == 0 and "д" in str(model.get("reset", "")))
                 if is_lockout:
                     w_pct = 0
                     w_frac = 0.0
+                    m_reset = model.get("reset", "")
                     if "д" in str(m_reset) and "д" not in str(w_reset):
                         w_reset = m_reset
                     elif "кулдаун" in str(w_reset).lower():
@@ -171,7 +175,7 @@ def main():
                 else:
                     c_w = " color=#000000"
 
-                row_w = f"   7дн: [{bar_w}] {w_pct:>3}%  ({w_reset})"
+                row_w = f"   Argon 7дн: [{bar_w}] {w_pct:>3}%  ({w_reset})" if is_argon else f"   7дн: [{bar_w}] {w_pct:>3}%  ({w_reset})"
                 print(f"{row_w} | font=Menlo size=12 trim=false{c_w}")
 
     # Separator before actions
