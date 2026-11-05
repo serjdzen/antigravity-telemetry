@@ -275,17 +275,21 @@ def discover_local_language_server(force=False):
             _CACHED_LS_TOKEN = None
 
     try:
-        # 1. Get csrf_token from ps
-        ps_out = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=1.5).stdout
+        # 1. Get csrf_token and host_bridge_url from ps
+        ps_out = subprocess.run(["ps", "auxww"], capture_output=True, text=True, timeout=1.5).stdout
         m = re.search(r"language_server.*--csrf_token\s+([a-f0-9-]+)", ps_out)
         if not m:
             return None, None
         csrf_token = m.group(1)
 
-        # 2. Get listening ports of language_server
-        lsof_out = subprocess.run(["lsof", "-nP", "-a", "-c", "language_server", "-iTCP", "-sTCP:LISTEN"], capture_output=True, text=True, timeout=1.5).stdout
-        ports = re.findall(r":(\d+)\s+\(LISTEN\)", lsof_out)
-        for p in ports:
+        # Fast path: extract host_bridge_url (language_server Connect-RPC is host_bridge + 2)
+        candidate_ports = []
+        m_hb = re.search(r"--host_bridge_url=https?://127\.0\.0\.1:(\d+)", ps_out)
+        if m_hb:
+            hb = int(m_hb.group(1))
+            candidate_ports.extend([hb + 2, hb + 1, hb + 3, hb - 1])
+
+        for p in candidate_ports:
             try:
                 url = f"http://127.0.0.1:{p}/exa.language_server_pb.LanguageServerService/GetStatus"
                 req = urllib.request.Request(
@@ -294,7 +298,27 @@ def discover_local_language_server(force=False):
                     headers={"Content-Type": "application/json", "x-codeium-csrf-token": csrf_token},
                     method="POST"
                 )
-                with urllib.request.urlopen(req, timeout=0.4) as resp:
+                with urllib.request.urlopen(req, timeout=0.25) as resp:
+                    if resp.status == 200:
+                        _CACHED_LS_PORT = int(p)
+                        _CACHED_LS_TOKEN = csrf_token
+                        return _CACHED_LS_PORT, _CACHED_LS_TOKEN
+            except Exception:
+                continue
+
+        # Fallback to lsof if candidate ports did not match
+        lsof_out = subprocess.run(["lsof", "-nP", "-a", "-c", "language_server", "-iTCP", "-sTCP:LISTEN"], capture_output=True, text=True, timeout=1.0).stdout
+        ports = re.findall(r":(\d+)\s+\(LISTEN\)", lsof_out)
+        for p in ports[:15]:
+            try:
+                url = f"http://127.0.0.1:{p}/exa.language_server_pb.LanguageServerService/GetStatus"
+                req = urllib.request.Request(
+                    url,
+                    data=b"{}",
+                    headers={"Content-Type": "application/json", "x-codeium-csrf-token": csrf_token},
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=0.3) as resp:
                     if resp.status == 200:
                         _CACHED_LS_PORT = int(p)
                         _CACHED_LS_TOKEN = csrf_token
@@ -496,6 +520,14 @@ def fetch_account_quota(acc):
         if groups:
             acc_data["models"] = parse_quota_groups(groups)
 
+    if is_active and not any(m.get("pool_id") == "argon" for m in acc_data["models"]):
+        # Ensure active account always retains Argon from local Language Server
+        local_groups = query_local_quota_summary()
+        if local_groups:
+            argon_m = next((m for m in parse_quota_groups(local_groups) if m.get("pool_id") == "argon"), None)
+            if argon_m:
+                acc_data["models"].append(argon_m)
+
     # 2. Fallback to fetchAvailableModels if summary returned nothing
     if not acc_data["models"]:
         quota_data = query_quota(access_token)
@@ -603,6 +635,7 @@ def get_all_quotas_data(force_refresh=False):
             pass
 
     # If an individual account hit a transient network error, fall back to its cached quota
+    active_email = get_active_antigravity_account()
     for i, res in enumerate(results):
         if res.get("status") == "error" and res.get("error_type") == "network_error":
             cached_acc = prev_cache.get(res.get("email"))
@@ -612,6 +645,14 @@ def get_all_quotas_data(force_refresh=False):
                     "cached_fallback": True,
                     "transient_error": res.get("error")
                 }
+        # Safeguard: preserve cached Argon for active account if not present in this cycle
+        if active_email and res.get("email", "").lower() == active_email.lower():
+            if not any(m.get("pool_id") == "argon" for m in res.get("models", [])):
+                cached_acc = prev_cache.get(res.get("email"))
+                if cached_acc:
+                    cached_argon = next((m for m in cached_acc.get("models", []) if m.get("pool_id") == "argon"), None)
+                    if cached_argon:
+                        res.setdefault("models", []).append(cached_argon)
 
     # Cache successful data
     if any(r.get("status") == "ok" for r in results):
