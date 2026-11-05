@@ -675,7 +675,7 @@ def parse_and_display_quota(account_email, data_or_acc):
                 w_reset = m.get("weekly_reset", "готов")
                 w_frac = m.get("weekly_fraction", 1.0)
                 bar_w = render_progress_bar(w_frac, width=5)
-                print(f"  ⚡ Argon 7дн: {bar_w}  ({w_reset})")
+                print(f"  ⚡ Argon: {bar_w}  ({w_reset})")
                 continue
 
             bar_5h = render_progress_bar(m.get("fraction", 1.0), width=5)

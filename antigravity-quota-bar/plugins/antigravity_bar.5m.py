@@ -146,7 +146,7 @@ def main():
                     else:
                         c_5h = " color=#000000"
 
-                    row_5h = f"   5ч:  [{bar_5h}] {m_pct:>3}%  ({m_reset})"
+                    row_5h = f"   5ч:    [{bar_5h}] {m_pct:>3}%  ({m_reset})"
                     print(f"{row_5h} | font=Menlo size=12 trim=false{c_5h}")
 
                 # 2. 7-day quota row
@@ -175,7 +175,7 @@ def main():
                 else:
                     c_w = " color=#000000"
 
-                row_w = f"   Argon 7дн: [{bar_w}] {w_pct:>3}%  ({w_reset})" if is_argon else f"   7дн: [{bar_w}] {w_pct:>3}%  ({w_reset})"
+                row_w = f"   Argon: [{bar_w}] {w_pct:>3}%  ({w_reset})" if is_argon else f"   7дн:   [{bar_w}] {w_pct:>3}%  ({w_reset})"
                 print(f"{row_w} | font=Menlo size=12 trim=false{c_w}")
 
     # Separator before actions
