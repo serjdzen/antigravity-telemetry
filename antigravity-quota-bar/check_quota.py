@@ -25,7 +25,7 @@ import urllib.parse
 import webbrowser
 import base64
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone
 
 # Ensure UTF-8 output on Windows consoles
@@ -453,9 +453,11 @@ def parse_quota_groups(groups):
                     "fraction": five_h_frac if has_5h else (week_frac if week_frac is not None else 1.0),
                     "percentage": int(round(five_h_frac * 100)) if has_5h else (int(round(week_frac * 100)) if week_frac is not None else 100),
                     "reset": format_reset_time(five_h_reset) if has_5h else format_reset_time(week_reset),
+                    "reset_iso": five_h_reset if has_5h else week_reset,
                     "weekly_fraction": week_frac if week_frac is not None else 1.0,
                     "weekly_percentage": int(round(week_frac * 100)) if week_frac is not None else 100,
                     "weekly_reset": format_reset_time(week_reset) if week_reset else "готов",
+                    "weekly_reset_iso": week_reset,
                 }
         return None
 
@@ -472,6 +474,46 @@ def parse_quota_groups(groups):
         models.append(a_m)
 
     return models
+
+
+def recalculate_cached_argon(model_dict):
+    """
+    Recalculates dynamic reset countdown for cached Argon quota.
+    If weekly window has expired, resets quota to 100% ('готов').
+    """
+    if not model_dict or model_dict.get("pool_id") != "argon":
+        return model_dict
+
+    m = dict(model_dict)
+    w_iso = m.get("weekly_reset_iso") or m.get("reset_iso")
+    if not w_iso:
+        return m
+
+    try:
+        clean_ts = str(w_iso).replace("Z", "+00:00")
+        target = datetime.fromisoformat(clean_ts)
+        now = datetime.now(timezone.utc)
+        diff = target - now
+        total_seconds = int(diff.total_seconds())
+
+        if total_seconds <= 0:
+            # Weekly quota window has fully expired and renewed
+            m["percentage"] = 100
+            m["fraction"] = 1.0
+            m["reset"] = "готов"
+            m["weekly_percentage"] = 100
+            m["weekly_fraction"] = 1.0
+            m["weekly_reset"] = "готов"
+            m["weekly_reset_iso"] = None
+            m["reset_iso"] = None
+        else:
+            updated_time_str = format_reset_time(w_iso)
+            m["reset"] = updated_time_str
+            m["weekly_reset"] = updated_time_str
+    except Exception:
+        pass
+
+    return m
 
 
 def fetch_account_quota(acc):
@@ -630,29 +672,36 @@ def get_all_quotas_data(force_refresh=False):
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
                 c_data = json.load(f)
                 if isinstance(c_data, list):
-                    prev_cache = {item.get("email"): item for item in c_data if item.get("status") == "ok"}
+                    prev_cache = {
+                        (item.get("email") or "").strip().lower(): item
+                        for item in c_data if item.get("status") == "ok"
+                    }
         except Exception:
             pass
 
     # If an individual account hit a transient network error, fall back to its cached quota
     active_email = get_active_antigravity_account()
     for i, res in enumerate(results):
+        acc_email = (res.get("email") or "").strip().lower()
         if res.get("status") == "error" and res.get("error_type") == "network_error":
-            cached_acc = prev_cache.get(res.get("email"))
+            cached_acc = prev_cache.get(acc_email)
             if cached_acc and cached_acc.get("models"):
                 results[i] = {
                     **cached_acc,
                     "cached_fallback": True,
                     "transient_error": res.get("error")
                 }
-        # Safeguard: preserve cached Argon for active account if not present in this cycle
-        if active_email and res.get("email", "").lower() == active_email.lower():
-            if not any(m.get("pool_id") == "argon" for m in res.get("models", [])):
-                cached_acc = prev_cache.get(res.get("email"))
-                if cached_acc:
-                    cached_argon = next((m for m in cached_acc.get("models", []) if m.get("pool_id") == "argon"), None)
-                    if cached_argon:
-                        res.setdefault("models", []).append(cached_argon)
+                res = results[i]
+
+        # Smart Argon Persistence: preserve cached Argon for ANY account that previously had it,
+        # unless fresh data in this cycle already contains Argon
+        if not any(m.get("pool_id") == "argon" for m in res.get("models", [])):
+            cached_acc = prev_cache.get(acc_email)
+            if cached_acc:
+                cached_argon = next((m for m in cached_acc.get("models", []) if m.get("pool_id") == "argon"), None)
+                if cached_argon:
+                    updated_argon = recalculate_cached_argon(cached_argon)
+                    res.setdefault("models", []).append(updated_argon)
 
     # Cache successful data
     if any(r.get("status") == "ok" for r in results):
@@ -1630,7 +1679,7 @@ HTML_DASHBOARD_TEMPLATE = """
         </div>
       </div>
       <div class="btn-group">
-        <button class="btn btn-secondary" onclick="fetchData(true)">🔄 Обновить</button>
+        <button class="btn btn-secondary" id="refresh-btn" onclick="fetchData(true)">🔄 Обновить</button>
         <button class="btn btn-primary" onclick="addAccount()">➕ Добавить аккаунт</button>
       </div>
     </header>
@@ -1800,12 +1849,16 @@ HTML_DASHBOARD_TEMPLATE = """
 
   <script>
     const EMBEDDED_DATA = /*EMBEDDED_DATA_PLACEHOLDER*/ null;
+    let isFetching = false;
 
     async function fetchData(force = false) {
+      if (isFetching) return;
       const updatedEl = document.getElementById('last-updated');
+      const refreshBtn = document.getElementById('refresh-btn');
 
-      // 1. Instant rendering from pre-embedded data (Zero-Server mode)
-      if (EMBEDDED_DATA && !force) {
+      // 1. Instant rendering from pre-embedded data (Zero-Server mode) on initial page load
+      if (EMBEDDED_DATA && !force && !window.__initialDataRendered) {
+        window.__initialDataRendered = true;
         renderAccounts(EMBEDDED_DATA.accounts || []);
         if (EMBEDDED_DATA.token_analytics) {
           renderTokenAnalytics(EMBEDDED_DATA.token_analytics);
@@ -1815,25 +1868,32 @@ HTML_DASHBOARD_TEMPLATE = """
         return;
       }
 
+      isFetching = true;
+      if (refreshBtn) {
+        refreshBtn.innerText = "⏳ Обновление...";
+        refreshBtn.disabled = true;
+      }
+
       if (force) {
-        if (location.protocol === 'file:') {
-          updatedEl.innerText = "Перезагрузка страницы...";
-          setTimeout(() => location.reload(), 300);
-          return;
-        }
         updatedEl.innerText = "Опрос квот Google Cloud...";
       }
 
+      const baseUrl = (location.protocol === 'file:') ? 'http://127.0.0.1:51122' : '';
       try {
-        const url = force ? '/api/quotas?refresh=true' : '/api/quotas';
-        const res = await fetch(url);
+        const url = `${baseUrl}/api/quotas${force ? '?refresh=true' : ''}`;
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 12000);
+        const res = await fetch(url, { signal: controller.signal });
+        clearTimeout(timeoutId);
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         const accounts = Array.isArray(data) ? data : (data.accounts || []);
         renderAccounts(accounts);
         if (data.token_analytics) {
           renderTokenAnalytics(data.token_analytics);
         }
-        
+
         let timeStr = new Date().toLocaleTimeString();
         if (data.cache_time) {
           timeStr = data.cache_time;
@@ -1841,6 +1901,14 @@ HTML_DASHBOARD_TEMPLATE = """
         const sourceLabel = data.is_cached ? ' (кэш меню-бара)' : ' (сеть)';
         updatedEl.innerText = `Синхронизировано: ${timeStr}${sourceLabel}`;
       } catch (err) {
+        console.warn("API fetch error:", err);
+        if (location.protocol === 'file:' && force) {
+          updatedEl.innerText = "Запрос обновления через меню-бар...";
+          window.location.href = "swiftbar://refreshPlugin?name=antigravity_bar.5m.py";
+          setTimeout(() => location.reload(), 2500);
+          return;
+        }
+
         if (EMBEDDED_DATA) {
           renderAccounts(EMBEDDED_DATA.accounts || []);
           if (EMBEDDED_DATA.token_analytics) {
@@ -1849,6 +1917,12 @@ HTML_DASHBOARD_TEMPLATE = """
           updatedEl.innerText = `Синхронизировано: ${EMBEDDED_DATA.cache_time || ''} (кэш меню-бара)`;
         } else {
           updatedEl.innerText = "Ошибка получения данных";
+        }
+      } finally {
+        isFetching = false;
+        if (refreshBtn) {
+          refreshBtn.innerText = "🔄 Обновить";
+          refreshBtn.disabled = false;
         }
       }
     }
@@ -1986,11 +2060,8 @@ HTML_DASHBOARD_TEMPLATE = """
     }
 
     function addAccount() {
-      if (location.protocol === 'file:') {
-        alert("Для добавления нового Google аккаунта выберите пункт «➕ Добавить аккаунт...» в строке меню SwiftBar.");
-        return;
-      }
-      window.open('/api/add-account', '_blank');
+      const baseUrl = (location.protocol === 'file:') ? 'http://127.0.0.1:51122' : '';
+      window.open(`${baseUrl}/api/add-account`, '_blank');
       alert("В новой вкладке откроется окно авторизации Google. После подтверждения вернитесь сюда и нажмите «Обновить».");
     }
 
@@ -2653,6 +2724,13 @@ def load_token_analytics_data():
 
 
 class DashboardHTTPHandler(BaseHTTPRequestHandler):
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
 
@@ -2660,7 +2738,13 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write(HTML_DASHBOARD_TEMPLATE.encode("utf-8"))
+            static_file = os.path.join(SCRIPT_DIR, "dashboard.html")
+            if os.path.exists(static_file):
+                with open(static_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+                self.wfile.write(content.encode("utf-8"))
+            else:
+                self.wfile.write(HTML_DASHBOARD_TEMPLATE.encode("utf-8"))
             return
 
         if parsed.path == "/api/quotas":
@@ -2678,7 +2762,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # Sort active account to the top
             data.sort(key=lambda x: 0 if x.get("is_active") else 1)
 
-            cache_time_str = None
+            # If force refreshed, keep static dashboard.html synchronized on disk
+            if force:
+                try:
+                    generate_static_dashboard(data)
+                except Exception:
+                    pass
+
+            cache_time_str = datetime.now().strftime("%H:%M:%S")
             is_from_cache = not force and os.path.exists(CACHE_FILE)
             if os.path.exists(CACHE_FILE):
                 try:
@@ -2697,16 +2788,22 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.end_headers()
-            self.wfile.write(json.dumps(payload).encode("utf-8"))
+            self.wfile.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
             return
 
         if parsed.path == "/api/token-analytics":
             tdata = load_token_analytics_data() or {}
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.end_headers()
-            self.wfile.write(json.dumps(tdata).encode("utf-8"))
+            self.wfile.write(json.dumps(tdata, ensure_ascii=False).encode("utf-8"))
             return
 
         if parsed.path == "/api/add-account":
@@ -2731,18 +2828,26 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         return
 
 
-def generate_static_dashboard(output_path=None):
+def generate_static_dashboard(data=None, output_path=None):
     """
     Generates a standalone, self-contained dashboard.html file
     with pre-embedded quota data from local cache / live check.
     Zero server processes required.
     """
-    data = get_all_quotas_data(force_refresh=False)
+    if data is None:
+        data = get_all_quotas_data(force_refresh=False)
+    else:
+        data = list(data)
+
     active_email = get_active_antigravity_account()
 
     for acc in data:
         email = (acc.get("email") or "").strip().lower()
         acc["is_active"] = bool(active_email and email == active_email.lower())
+        models = acc.get("models", [])
+        for idx, m in enumerate(models):
+            if m.get("pool_id") == "argon":
+                models[idx] = recalculate_cached_argon(m)
 
     data.sort(key=lambda x: 0 if x.get("is_active") else 1)
 
@@ -2777,16 +2882,59 @@ def generate_static_dashboard(output_path=None):
     return output_path
 
 
-def run_dashboard_server():
-    server = HTTPServer(("localhost", DASHBOARD_PORT), DashboardHTTPHandler)
+def is_dashboard_server_running(port=DASHBOARD_PORT):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.4)
+            return s.connect_ex(("127.0.0.1", port)) == 0
+    except Exception:
+        return False
+
+
+def start_dashboard_server_background():
+    cmd = [sys.executable, os.path.abspath(__file__), "--server", "--no-open"]
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        for _ in range(25):
+            time.sleep(0.1)
+            if is_dashboard_server_running():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def run_dashboard_server(open_browser=True):
+    try:
+        from http.server import ThreadingHTTPServer
+        server_cls = ThreadingHTTPServer
+    except ImportError:
+        server_cls = HTTPServer
+
+    try:
+        server = server_cls(("127.0.0.1", DASHBOARD_PORT), DashboardHTTPHandler)
+    except OSError as e:
+        if e.errno == 48:  # Address already in use
+            if open_browser:
+                webbrowser.open(f"http://localhost:{DASHBOARD_PORT}")
+            return
+        raise
+
     url = f"http://localhost:{DASHBOARD_PORT}"
     print(f"\n✨ Запуск Liquid Glass Dashboard на \033[1;36m{url}\033[0m")
-    print("Нажмите Ctrl+C для остановки сервера.")
-    webbrowser.open(url)
+    if open_browser:
+        webbrowser.open(url)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nСервер остановлен.")
+    finally:
+        server.server_close()
 
 
 def main():
@@ -2808,13 +2956,23 @@ def main():
 
     if len(sys.argv) > 1 and sys.argv[1] == "--dashboard":
         html_file = generate_static_dashboard()
-        file_url = Path(os.path.abspath(html_file)).as_uri()
-        print(f"\n✨ Открытие Liquid Glass Dashboard: \033[1;36m{file_url}\033[0m")
-        webbrowser.open(file_url)
+        server_ok = is_dashboard_server_running()
+        if not server_ok:
+            server_ok = start_dashboard_server_background()
+
+        if server_ok:
+            url = f"http://localhost:{DASHBOARD_PORT}"
+            print(f"\n✨ Открытие Liquid Glass Dashboard: \033[1;36m{url}\033[0m")
+            webbrowser.open(url)
+        else:
+            file_url = Path(os.path.abspath(html_file)).as_uri()
+            print(f"\n✨ Открытие Liquid Glass Dashboard: \033[1;36m{file_url}\033[0m")
+            webbrowser.open(file_url)
         return
 
     if len(sys.argv) > 1 and sys.argv[1] == "--server":
-        run_dashboard_server()
+        no_open = "--no-open" in sys.argv
+        run_dashboard_server(open_browser=not no_open)
         return
 
     accounts = load_accounts()

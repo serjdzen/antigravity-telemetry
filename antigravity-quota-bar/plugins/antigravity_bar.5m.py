@@ -73,6 +73,12 @@ def main():
         print(f"➕ Добавить первый аккаунт... | bash=\"python3\" param1=\"{os.path.join(PROJECT_DIR, 'check_quota.py')}\" param2=\"--add\" terminal=true")
         return
 
+    # Keep static dashboard.html synchronized with fresh menubar data
+    try:
+        check_quota.generate_static_dashboard(accounts_data)
+    except Exception:
+        pass
+
     # Detect currently active account in Antigravity desktop app
     active_email = check_quota.get_active_antigravity_account()
 
