@@ -3,12 +3,28 @@ import json
 import sqlite3
 from datetime import datetime
 from collections import defaultdict
-from tokenizers import Tokenizer
 
 SYSTEM_PROMPT_ESTIMATE = 3500  # Overhead on each model turn (system prompt, tools, schemas)
 
+
 def get_tokenizer():
-    return Tokenizer.from_pretrained('Qwen/Qwen2.5-7B')
+    """Loads HuggingFace Qwen tokenizer if available, otherwise returns None."""
+    try:
+        from tokenizers import Tokenizer
+        return Tokenizer.from_pretrained('Qwen/Qwen2.5-7B')
+    except Exception:
+        return None
+
+
+def _approx_tokens(text):
+    """Lightweight stdlib fallback token estimator when `tokenizers` is unavailable."""
+    if not text:
+        return 0
+    if not isinstance(text, str):
+        text = str(text)
+    ascii_cnt = sum(1 for ch in text if ord(ch) < 128)
+    non_ascii_cnt = len(text) - ascii_cnt
+    return max(1, (ascii_cnt + 3) // 4 + (non_ascii_cnt + 1) // 2)
 
 import urllib.parse
 
@@ -130,18 +146,22 @@ def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
     convo_ids = [d for d in os.listdir(brain_dir) if os.path.isdir(os.path.join(brain_dir, d))]
     titles_map, projects_map = load_conversation_metadata()
     
-    # We will load the tokenizer only if there are sessions to process
+    # We will load the tokenizer lazily only if there are sessions to process
     tok = None
+    tok_checked = False
 
     def count_tok(text):
-        nonlocal tok
+        nonlocal tok, tok_checked
         if not text:
             return 0
         if not isinstance(text, str):
             text = str(text)
-        if tok is None:
+        if not tok_checked:
             tok = get_tokenizer()
-        return len(tok.encode(text, add_special_tokens=False).ids)
+            tok_checked = True
+        if tok is not None:
+            return len(tok.encode(text, add_special_tokens=False).ids)
+        return _approx_tokens(text)
 
     updated_sessions = 0
     cached_sessions = 0
@@ -247,17 +267,33 @@ def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
                     first_req = first_line[:200]
 
             elif src == 'MODEL' and stype == 'PLANNER_RESPONSE':
-                m_cnt = count_tok(content)
-                tc_cnt = count_tok(json.dumps(tc, ensure_ascii=False)) if tc else 0
-                th_cnt = count_tok(thinking) if thinking else 0
-                out_tot = m_cnt + tc_cnt
+                raw_in = s.get('input_tokens')
+                raw_cache = s.get('cache_read_tokens')
+                raw_out = s.get('output_tokens')
+
+                th_est = count_tok(thinking) if thinking else 0
+                if isinstance(raw_out, int) and not isinstance(raw_out, bool) and raw_out >= 0:
+                    th_cnt = min(raw_out, th_est)
+                    out_tot = max(0, raw_out - th_cnt)
+                else:
+                    m_cnt = count_tok(content)
+                    tc_cnt = count_tok(json.dumps(tc, ensure_ascii=False)) if tc else 0
+                    th_cnt = th_est
+                    out_tot = m_cnt + tc_cnt
+
+                if (isinstance(raw_in, int) and not isinstance(raw_in, bool)) or (
+                    isinstance(raw_cache, int) and not isinstance(raw_cache, bool)
+                ):
+                    step_ctx = max(0, int(raw_in or 0)) + max(0, int(raw_cache or 0))
+                    current_history = step_ctx + out_tot + th_cnt
+                else:
+                    step_ctx = current_history
+                    current_history += (out_tot + th_cnt)
 
                 by_date[step_date]['model_tok'] += out_tot
                 by_date[step_date]['thinking_tok'] += th_cnt
                 by_date[step_date]['model_calls'] += 1
-                by_date[step_date]['context_tok'] += current_history
-
-                current_history += (out_tot + th_cnt)
+                by_date[step_date]['context_tok'] += step_ctx
             else:
                 # Tool output or system event
                 tl_cnt = count_tok(content)
