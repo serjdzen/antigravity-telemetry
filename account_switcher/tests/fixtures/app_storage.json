@@ -1,0 +1,7 @@
+{
+  "telemetry.sqm.machineId": "mock-machine-id-1234567890",
+  "theme": "vs-dark",
+  "agy.onboarding.lastLoginUsername": "active@example.com",
+  "agy.onboarding.lastLoginIsGcpTos": "false",
+  "window.zoomLevel": 0
+}
