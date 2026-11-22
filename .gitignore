@@ -21,6 +21,7 @@ antigravity-quota-bar/dashboard.html
 accounts.json
 .quota_cache.json
 dashboard.html
+.accounts.lock
 
 # Token Analytics: User chat history caches, generated dumps
 token_analytics/data/*.json
@@ -39,3 +40,6 @@ token_analytics/agy_quota_watchdog.py
 .vscode/
 *.swp
 *.swo
+
+# Local multi-agent orchestration workspace
+.agents/
