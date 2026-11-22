@@ -13,6 +13,7 @@ Usage:
   python3 check_quota.py --server      # Run background HTTP server
 """
 
+import argparse
 import os
 import sys
 import json
@@ -26,7 +27,17 @@ import webbrowser
 import base64
 from pathlib import Path
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+from account_store import atomic_write, email_key, read_accounts, roster_lock
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+try:
+    import account_switcher
+except ImportError:
+    account_switcher = None
 
 # Ensure UTF-8 output on Windows consoles
 if sys.platform == "win32":
@@ -67,20 +78,8 @@ GLOBAL_CONFIG_FILE = os.path.expanduser("~/.antigravity_accounts.json")
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".quota_cache.json")
 
 
-def load_accounts():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    if os.path.exists(GLOBAL_CONFIG_FILE):
-        try:
-            with open(GLOBAL_CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
+def load_accounts(*, strict=False):
+    return read_accounts(CONFIG_FILE, GLOBAL_CONFIG_FILE, strict=strict)
 
 
 def get_active_antigravity_account():
@@ -114,8 +113,103 @@ def get_active_antigravity_account():
 
 
 def save_accounts(accounts):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(accounts, f, indent=2, ensure_ascii=False)
+    atomic_write(CONFIG_FILE, json.dumps(accounts, indent=2, ensure_ascii=False))
+
+
+def register_account(email, refresh_token):
+    with roster_lock(CONFIG_FILE):
+        accounts = load_accounts(strict=True)
+        account = next((row for row in accounts if email_key(row["email"]) == email_key(email)), None)
+        timestamp = datetime.now().isoformat()
+        if account is None:
+            accounts.append({"email": email, "refresh_token": refresh_token, "added_at": timestamp})
+        else:
+            account.update(refresh_token=refresh_token, updated_at=timestamp)
+        save_accounts(accounts)
+
+
+def read_quota_cache():
+    try:
+        with open(CACHE_FILE, encoding="utf-8") as source:
+            cached = json.load(source)
+        if isinstance(cached, list):
+            return [row for row in cached if isinstance(row, dict) and isinstance(row.get("email"), str)]
+    except (OSError, ValueError):
+        pass
+    return []
+
+
+def save_quota_cache(rows):
+    atomic_write(CACHE_FILE, json.dumps(rows, indent=2, ensure_ascii=False))
+
+
+_EPOCH = datetime(1970, 1, 1)
+
+
+def _parse_mru_datetime(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip())
+        return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+    except ValueError:
+        return None
+
+
+def _touch_active_account_locked(accounts, active_email=None):
+    """Records last_used_at for the active account when it changes (caller must hold roster_lock)."""
+    if active_email is None:
+        active_email = get_active_antigravity_account()
+    active = email_key(active_email or "")
+    if not active or not accounts:
+        return False
+    target = next((acc for acc in accounts if email_key(acc["email"]) == active), None)
+    if target is None:
+        return False
+    timestamps = [dt for acc in accounts if (dt := _parse_mru_datetime(acc.get("last_used_at"))) is not None]
+    max_dt = max(timestamps, default=None)
+    target_dt = _parse_mru_datetime(target.get("last_used_at"))
+    if (
+        target_dt is not None
+        and max_dt is not None
+        and target_dt == max_dt
+        and sum(1 for dt in timestamps if dt == max_dt) == 1
+    ):
+        return False
+    now_dt = datetime.now()
+    if max_dt is not None and now_dt <= max_dt:
+        now_dt = max_dt + timedelta(microseconds=1)
+    target["last_used_at"] = now_dt.isoformat()
+    if os.path.exists(CONFIG_FILE):
+        save_accounts(accounts)
+    return True
+
+
+def account_view(rows, accounts):
+    """Join the latest settings with quota data, keeping the roster authoritative and MRU-sorted."""
+    quota_fields = ("status", "models", "error", "error_type", "cached_fallback", "transient_error")
+    by_email = {email_key(row["email"]): row for row in rows}
+    active = email_key(get_active_antigravity_account() or "")
+    ranked = []
+    for idx, account in enumerate(accounts):
+        key = email_key(account["email"])
+        row = by_email.get(key, {})
+        preferences = {
+            "email": account["email"],
+            "is_active": key == active,
+            "note": account["note"] if isinstance(account.get("note"), str) else "",
+            "show_in_swiftbar": account.get("show_in_swiftbar") is not False,
+        }
+        item = {
+            "status": "pending",
+            **{field: row[field] for field in quota_fields if field in row},
+            **preferences,
+        }
+        dt = _parse_mru_datetime(account.get("last_used_at"))
+        mru_key = -int((dt - _EPOCH).total_seconds() * 1_000_000) if dt is not None else 0
+        ranked.append(((0 if item["is_active"] else 1, 0 if dt is not None else 1, mru_key, idx), item))
+    ranked.sort(key=lambda pair: pair[0])
+    return [item for _, item in ranked]
 
 
 def refresh_access_token(refresh_token, retries=1, return_details=False):
@@ -274,8 +368,59 @@ def discover_local_language_server(force=False):
             _CACHED_LS_PORT = None
             _CACHED_LS_TOKEN = None
 
+    # Step 0: Fast deterministic IPC daemon file discovery (~/.gemini/antigravity/daemon/hub_*.json)
+    # Sub-millisecond (0.2ms), does not rely on ps or lsof
     try:
-        # 1. Get csrf_token and host_bridge_url from ps
+        daemon_dir = os.path.expanduser("~/.gemini/antigravity/daemon")
+        if os.path.isdir(daemon_dir):
+            hub_files = []
+            for fname in os.listdir(daemon_dir):
+                if fname.startswith("hub_") and fname.endswith(".json"):
+                    fpath = os.path.join(daemon_dir, fname)
+                    try:
+                        hub_files.append((fpath, os.path.getmtime(fpath)))
+                    except Exception:
+                        pass
+            # Sort by mtime descending (most recent first)
+            hub_files.sort(key=lambda x: x[1], reverse=True)
+
+            for fpath, _ in hub_files:
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    pid = meta.get("pid")
+                    http_port = meta.get("httpPort")
+                    csrf_token = meta.get("csrfToken")
+                    if not http_port or not csrf_token:
+                        continue
+                    # Verify process is still alive if PID is present
+                    if pid:
+                        try:
+                            os.kill(int(pid), 0)
+                        except OSError:
+                            continue  # Process no longer exists, skip stale file
+                        except Exception:
+                            pass
+                    # Verify port responds to GetStatus
+                    url = f"http://127.0.0.1:{http_port}/exa.language_server_pb.LanguageServerService/GetStatus"
+                    req = urllib.request.Request(
+                        url,
+                        data=b"{}",
+                        headers={"Content-Type": "application/json", "x-codeium-csrf-token": csrf_token},
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(req, timeout=0.25) as resp:
+                        if resp.status == 200:
+                            _CACHED_LS_PORT = int(http_port)
+                            _CACHED_LS_TOKEN = csrf_token
+                            return _CACHED_LS_PORT, _CACHED_LS_TOKEN
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    try:
+        # 1. Fallback: Get csrf_token and host_bridge_url from ps
         ps_out = subprocess.run(["ps", "auxww"], capture_output=True, text=True, timeout=1.5).stdout
         m = re.search(r"language_server.*--csrf_token\s+([a-f0-9-]+)", ps_out)
         if not m:
@@ -346,7 +491,7 @@ def query_local_quota_summary():
             headers={"Content-Type": "application/json", "x-codeium-csrf-token": token},
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=0.8) as resp:
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
             if resp.status == 200:
                 data = json.loads(resp.read().decode("utf-8"))
                 resp_obj = data.get("response", data)
@@ -476,6 +621,128 @@ def parse_quota_groups(groups):
     return models
 
 
+ANOMALY_RESET_SKEW_SECONDS = 120
+FULL_QUOTA_FRACTION_THRESHOLD = 0.999
+PRIMARY_POOL_IDS = ("gemini", "claude")
+
+
+def _parse_iso_utc(iso_str):
+    """Parses an ISO-8601 timestamp string into a UTC-aware datetime, or returns None."""
+    if not iso_str:
+        return None
+    try:
+        clean_ts = str(iso_str).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean_ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def reset_argon_model(model_dict):
+    """Returns a copy of a cached Argon model reset to 100% ('готов') with cleared timers."""
+    if not model_dict or model_dict.get("pool_id") != "argon":
+        return model_dict
+    m = dict(model_dict)
+    m["percentage"] = 100
+    m["fraction"] = 1.0
+    m["reset"] = "готов"
+    m["weekly_percentage"] = 100
+    m["weekly_fraction"] = 1.0
+    m["weekly_reset"] = "готов"
+    m["weekly_reset_iso"] = None
+    m["reset_iso"] = None
+    return m
+
+
+def _has_full_primary_quota(model_dict):
+    """Checks that a primary pool reports 100% 5h/7d quota from a reliable weekly source."""
+    has_reliable_weekly = (
+        model_dict.get("has_weekly") is True
+        or _parse_iso_utc(model_dict.get("weekly_reset_iso")) is not None
+    )
+    if not has_reliable_weekly:
+        return False
+    pct_5h = model_dict.get("percentage", 100)
+    frac_5h = model_dict.get("fraction", 1.0)
+    pct_7d = model_dict.get("weekly_percentage", 100)
+    frac_7d = model_dict.get("weekly_fraction", 1.0)
+    return (
+        pct_5h == 100
+        and pct_7d == 100
+        and (frac_5h is None or frac_5h >= FULL_QUOTA_FRACTION_THRESHOLD)
+        and (frac_7d is None or frac_7d >= FULL_QUOTA_FRACTION_THRESHOLD)
+    )
+
+
+def detect_anomalous_pool_reset(cached_acc, fresh_res, now=None, skew_seconds=ANOMALY_RESET_SKEW_SECONDS):
+    """
+    Detects an early/anomalous Google quota reset on primary pools (Gemini/Claude)
+    between cached_acc and fresh_res so cached Argon can also be reset.
+
+    Requires ALL present primary pools in fresh_res to be 100% with valid weekly_reset_iso
+    (ignoring fetchAvailableModels fallback and cached_fallback), and at least one primary
+    pool to have transitioned from <100% before its cached reset window expired.
+    """
+    if not cached_acc or not fresh_res:
+        return False
+    if fresh_res.get("status") != "ok" or fresh_res.get("cached_fallback"):
+        return False
+
+    fresh_pools = {
+        m.get("pool_id"): m
+        for m in fresh_res.get("models", [])
+        if m.get("pool_id") in PRIMARY_POOL_IDS
+    }
+    if not fresh_pools:
+        return False
+    if not all(_has_full_primary_quota(m) for m in fresh_pools.values()):
+        return False
+
+    prev_pools = {
+        m.get("pool_id"): m
+        for m in cached_acc.get("models", [])
+        if m.get("pool_id") in PRIMARY_POOL_IDS
+    }
+    now_utc = now or datetime.now(timezone.utc)
+    skew = timedelta(seconds=skew_seconds)
+
+    for pid, curr_m in fresh_pools.items():
+        prev_m = prev_pools.get(pid)
+        if not prev_m:
+            continue
+
+        prev_w_pct = prev_m.get("weekly_percentage", 100)
+        prev_w_frac = prev_m.get("weekly_fraction", 1.0)
+        prev_w_dt = _parse_iso_utc(prev_m.get("weekly_reset_iso"))
+        curr_w_dt = _parse_iso_utc(curr_m.get("weekly_reset_iso"))
+
+        had_weekly_usage = prev_w_pct < 100 or (
+            prev_w_frac is not None and prev_w_frac < FULL_QUOTA_FRACTION_THRESHOLD
+        )
+        if had_weekly_usage and prev_w_dt is not None and prev_w_dt > now_utc + skew:
+            return True
+
+        prev_5h_pct = prev_m.get("percentage", 100)
+        prev_5h_frac = prev_m.get("fraction", 1.0)
+        prev_5h_dt = _parse_iso_utc(prev_m.get("reset_iso"))
+        had_5h_usage = prev_5h_pct < 100 or (
+            prev_5h_frac is not None and prev_5h_frac < FULL_QUOTA_FRACTION_THRESHOLD
+        )
+        if (
+            had_5h_usage
+            and prev_5h_dt is not None
+            and prev_5h_dt > now_utc + skew
+            and prev_w_dt is not None
+            and curr_w_dt is not None
+            and curr_w_dt > prev_w_dt + skew
+        ):
+            return True
+
+    return False
+
+
 def recalculate_cached_argon(model_dict):
     """
     Recalculates dynamic reset countdown for cached Argon quota.
@@ -486,32 +753,46 @@ def recalculate_cached_argon(model_dict):
 
     m = dict(model_dict)
     w_iso = m.get("weekly_reset_iso") or m.get("reset_iso")
-    if not w_iso:
+    target = _parse_iso_utc(w_iso)
+    if target is None:
         return m
 
-    try:
-        clean_ts = str(w_iso).replace("Z", "+00:00")
-        target = datetime.fromisoformat(clean_ts)
-        now = datetime.now(timezone.utc)
-        diff = target - now
-        total_seconds = int(diff.total_seconds())
+    total_seconds = int((target - datetime.now(timezone.utc)).total_seconds())
+    if total_seconds <= 0:
+        return reset_argon_model(m)
 
-        if total_seconds <= 0:
-            # Weekly quota window has fully expired and renewed
+    updated_time_str = format_reset_time(w_iso)
+    m["reset"] = updated_time_str
+    m["weekly_reset"] = updated_time_str
+    return m
+
+
+def recalculate_cached_model(model_dict):
+    """
+    Recalculates dynamic reset countdowns for any cached model (Gemini, Claude, Argon).
+    If reset window has passed, marks quota as 'готов'.
+    """
+    if not model_dict or not isinstance(model_dict, dict):
+        return model_dict
+    if model_dict.get("pool_id") == "argon":
+        return recalculate_cached_argon(model_dict)
+
+    m = dict(model_dict)
+    # Recalculate 5h session reset
+    reset_iso = m.get("reset_iso")
+    if reset_iso and m.get("has_5h", True):
+        m["reset"] = format_reset_time(reset_iso)
+        if m["reset"] == "готов":
             m["percentage"] = 100
             m["fraction"] = 1.0
-            m["reset"] = "готов"
+
+    # Recalculate weekly reset
+    w_iso = m.get("weekly_reset_iso")
+    if w_iso:
+        m["weekly_reset"] = format_reset_time(w_iso)
+        if m["weekly_reset"] == "готов":
             m["weekly_percentage"] = 100
             m["weekly_fraction"] = 1.0
-            m["weekly_reset"] = "готов"
-            m["weekly_reset_iso"] = None
-            m["reset_iso"] = None
-        else:
-            updated_time_str = format_reset_time(w_iso)
-            m["reset"] = updated_time_str
-            m["weekly_reset"] = updated_time_str
-    except Exception:
-        pass
 
     return m
 
@@ -645,80 +926,113 @@ def fetch_account_quota(acc):
 
 def get_all_quotas_data(force_refresh=False):
     """Returns structured list of accounts grouped by quota pools (parallelized)."""
-    # Instant cache return if fresh (< 6 minutes, matching SwiftBar 5m cycle)
-    if not force_refresh and os.path.exists(CACHE_FILE):
+    with roster_lock(CONFIG_FILE):
+        accounts = load_accounts()
+        if not accounts:
+            return []
+        _touch_active_account_locked(accounts)
+        cached = read_quota_cache()
         try:
-            cache_age = time.time() - os.path.getmtime(CACHE_FILE)
-            if cache_age < 360:
-                with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                    cached = json.load(f)
-                    if cached:
-                        return cached
-        except Exception:
-            pass
-
-    accounts = load_accounts()
-    if not accounts:
-        return []
+            fresh = time.time() - os.path.getmtime(CACHE_FILE) < 360
+        except OSError:
+            fresh = False
+        if not force_refresh and fresh:
+            view = account_view(cached, accounts)
+            if any(row["status"] == "ok" for row in view) and all(row["status"] != "pending" for row in view):
+                return view
 
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=min(len(accounts), 8)) as executor:
         results = list(executor.map(fetch_account_quota, accounts))
 
-    # Load previous cache if available for graceful fallback on transient network errors
-    prev_cache = {}
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                c_data = json.load(f)
-                if isinstance(c_data, list):
-                    prev_cache = {
-                        (item.get("email") or "").strip().lower(): item
-                        for item in c_data if item.get("status") == "ok"
-                    }
-        except Exception:
-            pass
+    # Recheck the connection after polling. An OAuth replacement or delete may have
+    # completed while the requests were in flight.
+    def connection_id(account):
+        return tuple(account.get(field) for field in ("added_at", "updated_at", "refresh_token"))
 
-    # If an individual account hit a transient network error, fall back to its cached quota
+    connections = {email_key(account["email"]): connection_id(account) for account in accounts}
+    with roster_lock(CONFIG_FILE):
+        current = load_accounts()
+        _touch_active_account_locked(current)
+        valid = {
+            key for account in current
+            if (key := email_key(account["email"])) in connections
+            and connections[key] == connection_id(account)
+        }
+        previous = read_quota_cache()
+        results = [row for row in results if email_key(row["email"]) in valid]
+        merged = merge_quota_results(results, previous)
+        # Preserve newer cached results for accounts added or reauthorized during the poll.
+        merged.extend(row for row in previous if email_key(row["email"]) not in valid)
+        registered = {email_key(account["email"]) for account in current}
+        merged = [row for row in merged if email_key(row["email"]) in registered]
+        try:
+            save_quota_cache(merged)
+        except OSError:
+            pass
+        return account_view(merged, current)
+
+
+def merge_quota_results(results, previous):
+    prev_cache = {
+        email_key(row["email"]): row for row in previous if row.get("status") == "ok"
+    }
+    # If an individual account hit a transient network error or active IDE account hit OAuth error,
+    # gracefully fall back to its cached quota with live reset timers
     active_email = get_active_antigravity_account()
+    active_key = email_key(active_email) if active_email else ""
     for i, res in enumerate(results):
-        acc_email = (res.get("email") or "").strip().lower()
-        if res.get("status") == "error" and res.get("error_type") == "network_error":
-            cached_acc = prev_cache.get(acc_email)
-            if cached_acc and cached_acc.get("models"):
+        acc_key = email_key(res.get("email") or "")
+        is_active_acc = bool(active_key and acc_key == active_key)
+        if res.get("status") == "error":
+            cached_acc = prev_cache.get(acc_key)
+            should_use_cache = False
+            if res.get("error_type") == "network_error":
+                should_use_cache = True
+            elif is_active_acc and res.get("error_type") in ("invalid_grant", "auth_error", "config_error"):
+                # Active IDE session is still valid in IDE, but backup token in accounts.json failed.
+                # Preserve valid cached quotas instead of flashing a false error.
+                should_use_cache = True
+
+            if should_use_cache and cached_acc and cached_acc.get("models"):
+                updated_models = [recalculate_cached_model(m) for m in cached_acc.get("models", [])]
                 results[i] = {
                     **cached_acc,
+                    "status": "ok",
+                    "models": updated_models,
                     "cached_fallback": True,
                     "transient_error": res.get("error")
                 }
                 res = results[i]
 
         # Smart Argon Persistence: preserve cached Argon for ANY account that previously had it,
-        # unless fresh data in this cycle already contains Argon
+        # unless fresh data in this cycle already contains Argon.
+        # If Google unexpectedly reset primary pools (Gemini/Claude) early, reset Argon too.
         if not any(m.get("pool_id") == "argon" for m in res.get("models", [])):
-            cached_acc = prev_cache.get(acc_email)
+            cached_acc = prev_cache.get(acc_key)
             if cached_acc:
                 cached_argon = next((m for m in cached_acc.get("models", []) if m.get("pool_id") == "argon"), None)
                 if cached_argon:
-                    updated_argon = recalculate_cached_argon(cached_argon)
+                    already_full = (
+                        cached_argon.get("weekly_percentage", 100) == 100
+                        and cached_argon.get("percentage", 100) == 100
+                        and not cached_argon.get("weekly_reset_iso")
+                    )
+                    if not already_full and detect_anomalous_pool_reset(cached_acc, res):
+                        updated_argon = reset_argon_model(cached_argon)
+                    else:
+                        updated_argon = recalculate_cached_argon(cached_argon)
                     res.setdefault("models", []).append(updated_argon)
 
-    # Cache successful data
-    if any(r.get("status") == "ok" for r in results):
-        try:
-            with open(CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(results, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
-    elif os.path.exists(CACHE_FILE):
-        # Fallback to cache if network is temporarily offline (e.g. right after system boot)
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                cached = json.load(f)
-                if cached:
-                    return cached
-        except Exception:
-            pass
+    if not any(row.get("status") == "ok" for row in results):
+        results = [
+            {
+                **cached,
+                "models": [recalculate_cached_model(model) for model in cached.get("models", [])],
+                "cached_fallback": True,
+            } if (cached := prev_cache.get(email_key(row["email"]))) else row
+            for row in results
+        ]
 
     return results
 
@@ -747,14 +1061,26 @@ def parse_and_display_quota(account_email, data_or_acc):
         print(f"  ⚠️  Не удалось получить данные о моделях (пустой ответ)")
         return
 
+    active_email = get_active_antigravity_account()
+    is_active = bool(
+        active_email
+        and account_email
+        and email_key(str(account_email)) == email_key(str(active_email))
+    )
+    account_header = (
+        f"\n👤 \033[1;32m{account_email} (Активен)\033[0m"
+        if is_active
+        else f"\n👤 \033[1m{account_email}\033[0m"
+    )
+
     # Structured acc_data from get_all_quotas_data
     if isinstance(data_or_acc, dict) and "models" in data_or_acc and isinstance(data_or_acc.get("models"), list):
         if data_or_acc.get("status") == "error":
-            print(f"\n👤 \033[1m{account_email}\033[0m")
+            print(account_header)
             print(f"  ⚠️  {data_or_acc.get('error')}")
             return
 
-        print(f"\n👤 \033[1m{account_email}\033[0m")
+        print(account_header)
         print("─" * 68)
         for m in data_or_acc.get("models", []):
             if m.get("pool_id") in ("image", "claude") or "claude" in m.get("name", "").lower():
@@ -792,7 +1118,7 @@ def parse_and_display_quota(account_email, data_or_acc):
 
     # Fallback if raw models dict passed
     models = data_or_acc.get("models", {})
-    print(f"\n👤 \033[1m{account_email}\033[0m")
+    print(account_header)
     print("─" * 58)
     for m_id, m_data in models.items():
         if "gemini" in m_id.lower() and "image" not in m_id.lower():
@@ -899,22 +1225,7 @@ def add_account_flow():
 
             email = fetch_account_email(access_token)
 
-            accounts = load_accounts()
-            updated = False
-            for acc in accounts:
-                if acc.get("email") == email:
-                    acc["refresh_token"] = refresh_token
-                    acc["updated_at"] = datetime.now().isoformat()
-                    updated = True
-                    break
-            if not updated:
-                accounts.append({
-                    "email": email,
-                    "refresh_token": refresh_token,
-                    "added_at": datetime.now().isoformat()
-                })
-
-            save_accounts(accounts)
+            register_account(email, refresh_token)
             print(f"✨ Аккаунт \033[92m{email}\033[0m успешно сохранен в {CONFIG_FILE}!")
 
             print("📊 Проверка актуальной квоты...")
@@ -939,12 +1250,18 @@ HTML_DASHBOARD_TEMPLATE = """
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js" async onload="window.__chartReady=true;if(window.__onChartLoaded)window.__onChartLoaded();" onerror="window.__chartLoadFailed=true;if(window.__onChartLoaded)window.__onChartLoaded();"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif;
-      background: radial-gradient(circle at 10% 20%, rgba(30, 41, 59, 0.8) 0%, rgba(15, 23, 42, 1) 90.2%);
+      background-color: #0f172a;
+      background-image:
+        radial-gradient(600px circle at 10% 10%, rgba(56, 189, 248, 0.16), transparent 65%),
+        radial-gradient(700px circle at 90% 90%, rgba(129, 140, 248, 0.16), transparent 65%),
+        radial-gradient(500px circle at 55% 40%, rgba(16, 185, 129, 0.10), transparent 65%),
+        radial-gradient(circle at 10% 20%, rgba(30, 41, 59, 0.8) 0%, rgba(15, 23, 42, 1) 90.2%);
+      background-attachment: fixed;
       color: #f1f5f9;
       min-height: 100vh;
       display: flex;
@@ -953,19 +1270,6 @@ HTML_DASHBOARD_TEMPLATE = """
       padding: 40px 20px;
       overflow-x: hidden;
     }
-    
-    /* Background ambient blur orbs */
-    .orb {
-      position: fixed;
-      border-radius: 50%;
-      filter: blur(100px);
-      z-index: 0;
-      pointer-events: none;
-      opacity: 0.35;
-    }
-    .orb-1 { width: 600px; height: 600px; background: #38bdf8; top: -150px; left: -100px; }
-    .orb-2 { width: 700px; height: 700px; background: #818cf8; bottom: -150px; right: -150px; }
-    .orb-3 { width: 500px; height: 500px; background: #10b981; top: 35%; left: 50%; }
 
     .container {
       width: 100%;
@@ -980,8 +1284,8 @@ HTML_DASHBOARD_TEMPLATE = """
       justify-content: space-between;
       align-items: center;
       background: rgba(255, 255, 255, 0.04);
-      backdrop-filter: blur(20px);
-      -webkit-backdrop-filter: blur(20px);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
       border: 1px solid rgba(255, 255, 255, 0.08);
       border-radius: 20px;
       padding: 18px 28px;
@@ -1010,7 +1314,7 @@ HTML_DASHBOARD_TEMPLATE = """
       display: inline-flex;
       align-items: center;
       gap: 7px;
-      transition: all 0.2s ease;
+      transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
       text-decoration: none;
       border: none;
       outline: none;
@@ -1043,26 +1347,23 @@ HTML_DASHBOARD_TEMPLATE = """
       gap: 20px;
     }
     .account-card {
-      background: rgba(255, 255, 255, 0.035);
-      backdrop-filter: blur(25px);
-      -webkit-backdrop-filter: blur(25px);
+      background: linear-gradient(155deg, rgba(30, 41, 59, 0.62) 0%, rgba(15, 23, 42, 0.78) 100%);
       border: 1px solid rgba(255, 255, 255, 0.09);
       border-radius: 20px;
       padding: 22px 24px;
-      box-shadow: 0 15px 35px rgba(0, 0, 0, 0.35);
-      transition: border-color 0.25s ease, transform 0.25s ease;
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
+      transition: border-color 0.18s ease;
       display: flex;
       flex-direction: column;
     }
     .account-card:hover {
-      border-color: rgba(56, 189, 248, 0.3);
-      transform: translateY(-2px);
+      border-color: rgba(56, 189, 248, 0.35);
     }
 
     .account-header {
       display: flex;
-      justify-content: space-between;
-      align-items: center;
+      flex-direction: column;
+      align-items: stretch;
       margin-bottom: 16px;
       padding-bottom: 14px;
       border-bottom: 1px solid rgba(255, 255, 255, 0.06);
@@ -1075,7 +1376,8 @@ HTML_DASHBOARD_TEMPLATE = """
     }
     .email-badge {
       display: flex;
-      align-items: center;
+      align-items: baseline;
+      flex-wrap: wrap;
       gap: 8px;
       font-size: 13.5px;
       font-weight: 600;
@@ -1085,9 +1387,68 @@ HTML_DASHBOARD_TEMPLATE = """
       overflow: hidden;
     }
     .email-text {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      overflow-wrap: anywhere;
+    }
+    .account-note {
+      color: #cbd5e1;
+      font-weight: 400;
+      overflow-wrap: anywhere;
+    }
+    .account-actions {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .account-actions .status-badge {
+      margin-right: auto;
+    }
+    .icon-button {
+      position: relative;
+      display: inline-grid;
+      place-items: center;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 8px;
+      color: #f8fafc;
+      width: 32px;
+      height: 32px;
+      cursor: pointer;
+      font-size: 16px;
+    }
+    .icon-button:hover:not(:disabled) { background: rgba(255, 255, 255, 0.14); }
+    .icon-button:focus-visible { outline: 2px solid #38bdf8; }
+    .icon-button:disabled { opacity: 0.55; cursor: default; }
+    .icon-button.eye-closed::after {
+      content: '';
+      position: absolute;
+      width: 20px;
+      height: 2px;
+      background: #f8fafc;
+      box-shadow: 0 1px #0f172a;
+      transform: rotate(-45deg);
+    }
+    .note-editor:not([hidden]) {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .note-editor input {
+      width: 100%;
+      padding: 8px;
+      color: #f8fafc;
+      background: #0f172a;
+      border: 1px solid #475569;
+      border-radius: 8px;
+    }
+    .note-editor .btn { padding: 6px 9px; font-size: 12px; }
+    #account-management-status:not(:empty) {
+      color: #cbd5e1;
+      font-size: 13px;
+      margin-bottom: 14px;
+    }
+    #account-management-status[data-error="true"] {
+      color: #fca5a5;
     }
     .status-dot {
       width: 10px; height: 10px;
@@ -1244,8 +1605,17 @@ HTML_DASHBOARD_TEMPLATE = """
     }
     @media (max-width: 900px) {
       .grid {
-        grid-template-columns: 1fr;
+        grid-template-columns: minmax(0, 1fr);
       }
+    }
+    @media (max-width: 600px) {
+      .header-bar {
+        align-items: stretch;
+        flex-direction: column;
+        gap: 14px;
+        padding: 16px;
+      }
+      .btn-group { flex-wrap: wrap; }
     }
     @media (max-width: 480px) {
       .pools-grid {
@@ -1272,13 +1642,11 @@ HTML_DASHBOARD_TEMPLATE = """
     /* ========================================================================= */
     .analytics-section {
       margin-top: 32px;
-      background: rgba(255, 255, 255, 0.035);
-      backdrop-filter: blur(25px);
-      -webkit-backdrop-filter: blur(25px);
+      background: linear-gradient(160deg, rgba(30, 41, 59, 0.58) 0%, rgba(15, 23, 42, 0.78) 100%);
       border: 1px solid rgba(255, 255, 255, 0.09);
       border-radius: 20px;
       padding: 28px;
-      box-shadow: 0 15px 35px rgba(0, 0, 0, 0.35);
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.3);
       display: flex;
       flex-direction: column;
       gap: 24px;
@@ -1346,10 +1714,9 @@ HTML_DASHBOARD_TEMPLATE = """
       display: flex;
       flex-direction: column;
       gap: 6px;
-      transition: transform 0.2s ease, border-color 0.2s ease;
+      transition: border-color 0.15s ease;
     }
     .kpi-card:hover {
-      transform: translateY(-2px);
       border-color: rgba(255, 255, 255, 0.15);
     }
     .kpi-header {
@@ -1415,13 +1782,12 @@ HTML_DASHBOARD_TEMPLATE = """
       display: inline-flex;
       align-items: center;
       gap: 6px;
-      transition: all 0.2s ease;
+      transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
       user-select: none;
     }
     .toggle-btn:hover {
       background: rgba(255, 255, 255, 0.08);
       color: #f1f5f9;
-      transform: translateY(-1px);
     }
     .toggle-btn.active {
       background: rgba(255, 255, 255, 0.12);
@@ -1473,7 +1839,7 @@ HTML_DASHBOARD_TEMPLATE = """
       border: 1px solid rgba(255, 255, 255, 0.08);
       background: rgba(255, 255, 255, 0.04);
       color: #94a3b8;
-      transition: all 0.2s ease;
+      transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
     }
     .preset-btn:hover {
       background: rgba(255, 255, 255, 0.08);
@@ -1494,7 +1860,7 @@ HTML_DASHBOARD_TEMPLATE = """
       font-family: Menlo, Monaco, monospace;
       outline: none;
       cursor: pointer;
-      transition: all 0.2s ease;
+      transition: background-color 0.15s ease, border-color 0.15s ease;
     }
     .glass-select:hover, .glass-select:focus {
       background: rgba(255, 255, 255, 0.1);
@@ -1649,7 +2015,7 @@ HTML_DASHBOARD_TEMPLATE = """
       padding: 5px 12px;
       border-radius: 10px;
       cursor: pointer;
-      transition: all 0.2s ease;
+      transition: background-color 0.15s ease;
     }
     .accordion-btn:hover {
       background: rgba(56, 189, 248, 0.15);
@@ -1662,13 +2028,56 @@ HTML_DASHBOARD_TEMPLATE = """
       color: #94a3b8;
       font-family: 'Plus Jakarta Sans', sans-serif;
     }
+
+    /* Account Switch Button & Native Top-Layer Modal */
+    .switch-account-btn {
+      padding: 5px 10px;
+      font-size: 12px;
+      border-radius: 8px;
+    }
+    dialog#switch-modal {
+      margin: auto;
+      padding: 24px 26px;
+      max-width: 440px;
+      width: calc(100% - 32px);
+      background: linear-gradient(155deg, rgba(30, 41, 59, 0.96) 0%, rgba(15, 23, 42, 0.98) 100%);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      border-radius: 20px;
+      color: #f8fafc;
+      box-shadow: 0 25px 60px rgba(0, 0, 0, 0.65);
+    }
+    dialog#switch-modal:modal {
+      overscroll-behavior: contain;
+    }
+    dialog#switch-modal::backdrop {
+      overflow: hidden;
+      overscroll-behavior: contain;
+      background: rgba(2, 6, 23, 0.72);
+    }
+    dialog#switch-modal h2 {
+      font-size: 17px;
+      font-weight: 700;
+      margin-bottom: 10px;
+    }
+    dialog#switch-modal p {
+      font-size: 13.5px;
+      color: #cbd5e1;
+      line-height: 1.5;
+      margin-bottom: 18px;
+    }
+    dialog#switch-modal .modal-email {
+      color: #38bdf8;
+      font-weight: 600;
+      overflow-wrap: anywhere;
+    }
+    dialog#switch-modal .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+    }
   </style>
 </head>
 <body>
-  <div class="orb orb-1"></div>
-  <div class="orb orb-2"></div>
-  <div class="orb orb-3"></div>
-
   <div class="container">
     <header class="header-bar">
       <div class="title-group">
@@ -1680,10 +2089,11 @@ HTML_DASHBOARD_TEMPLATE = """
       </div>
       <div class="btn-group">
         <button class="btn btn-secondary" id="refresh-btn" onclick="fetchData(true)">🔄 Обновить</button>
-        <button class="btn btn-primary" onclick="addAccount()">➕ Добавить аккаунт</button>
+        <button class="btn btn-primary" id="add-account-btn" onclick="addAccount()">➕ Добавить аккаунт</button>
       </div>
     </header>
 
+    <div id="account-management-status" role="status"></div>
     <div class="grid" id="accounts-container">
       <div class="empty-state">Опрос квот Google Cloud...</div>
     </div>
@@ -1843,29 +2253,55 @@ HTML_DASHBOARD_TEMPLATE = """
     </section>
 
     <div class="footer">
-      Google Antigravity 2.0 Monitor • Read-Only Session • Безопасный мониторинг без риска блокировки
+      Google Antigravity 2.0 Monitor
     </div>
   </div>
 
+  <dialog id="switch-modal" aria-labelledby="switch-modal-title">
+    <h2 id="switch-modal-title">Переключение аккаунта Antigravity</h2>
+    <p>Переключить активный аккаунт Antigravity на <span class="modal-email" id="switch-modal-email"></span>? Antigravity IDE будет безопасно перезапущена.</p>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary" id="switch-modal-cancel" onclick="closeSwitchModal()" autofocus>Отмена</button>
+      <button type="button" class="btn btn-primary" id="switch-modal-confirm" onclick="confirmSwitchAccount()">Переключить</button>
+    </div>
+  </dialog>
+
   <script>
     const EMBEDDED_DATA = /*EMBEDDED_DATA_PLACEHOLDER*/ null;
+    const canManageAccounts = location.protocol !== 'file:';
+    const managementStatus = document.getElementById('account-management-status');
     let isFetching = false;
+    let isManaging = false;
+    let lastAccountsSig = '';
+    let lastAnalyticsSig = '';
+    if (!canManageAccounts) {
+      managementStatus.textContent = 'Для управления аккаунтами откройте дашборд из SwiftBar.';
+    }
+
+    function analyticsSignature(tdata) {
+      const s = tdata && tdata.summary;
+      return s ? `${s.last_date || ''}|${s.tot_steps || 0}|${s.tot_unique_tok || 0}|${s.total_sessions || 0}` : '';
+    }
 
     async function fetchData(force = false) {
-      if (isFetching) return;
+      const switchDialog = document.getElementById('switch-modal');
+      if (isFetching || isManaging || document.querySelector('.note-editor:not([hidden])') || (switchDialog && switchDialog.open)) return;
       const updatedEl = document.getElementById('last-updated');
       const refreshBtn = document.getElementById('refresh-btn');
 
       // 1. Instant rendering from pre-embedded data (Zero-Server mode) on initial page load
       if (EMBEDDED_DATA && !force && !window.__initialDataRendered) {
         window.__initialDataRendered = true;
-        renderAccounts(EMBEDDED_DATA.accounts || []);
+        const embAccounts = EMBEDDED_DATA.accounts || [];
+        lastAccountsSig = JSON.stringify(embAccounts);
+        renderAccounts(embAccounts);
         if (EMBEDDED_DATA.token_analytics) {
+          lastAnalyticsSig = analyticsSignature(EMBEDDED_DATA.token_analytics);
           renderTokenAnalytics(EMBEDDED_DATA.token_analytics);
         }
         const timeStr = EMBEDDED_DATA.cache_time || new Date().toLocaleTimeString();
         updatedEl.innerText = `Синхронизировано: ${timeStr} (кэш меню-бара)`;
-        return;
+        if (!canManageAccounts) return;
       }
 
       isFetching = true;
@@ -1889,9 +2325,17 @@ HTML_DASHBOARD_TEMPLATE = """
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         const accounts = Array.isArray(data) ? data : (data.accounts || []);
-        renderAccounts(accounts);
+        const nextAccountsSig = JSON.stringify(accounts);
+        if (nextAccountsSig !== lastAccountsSig) {
+          lastAccountsSig = nextAccountsSig;
+          renderAccounts(accounts);
+        }
         if (data.token_analytics) {
-          renderTokenAnalytics(data.token_analytics);
+          const nextAnalyticsSig = analyticsSignature(data.token_analytics);
+          if (nextAnalyticsSig !== lastAnalyticsSig) {
+            lastAnalyticsSig = nextAnalyticsSig;
+            renderTokenAnalytics(data.token_analytics);
+          }
         }
 
         let timeStr = new Date().toLocaleTimeString();
@@ -1909,15 +2353,7 @@ HTML_DASHBOARD_TEMPLATE = """
           return;
         }
 
-        if (EMBEDDED_DATA) {
-          renderAccounts(EMBEDDED_DATA.accounts || []);
-          if (EMBEDDED_DATA.token_analytics) {
-            renderTokenAnalytics(EMBEDDED_DATA.token_analytics);
-          }
-          updatedEl.innerText = `Синхронизировано: ${EMBEDDED_DATA.cache_time || ''} (кэш меню-бара)`;
-        } else {
-          updatedEl.innerText = "Ошибка получения данных";
-        }
+        updatedEl.innerText = 'Не удалось обновить данные';
       } finally {
         isFetching = false;
         if (refreshBtn) {
@@ -1928,21 +2364,23 @@ HTML_DASHBOARD_TEMPLATE = """
     }
 
     function renderAccounts(accounts) {
+      lastAccountsSig = JSON.stringify(accounts || []);
       const container = document.getElementById('accounts-container');
       if (!accounts || accounts.length === 0) {
         container.innerHTML = '<div class="empty-state">Нет сохраненных аккаунтов. Нажмите «➕ Добавить аккаунт»</div>';
         return;
       }
 
-      container.innerHTML = accounts.map((acc, idx) => {
+      container.innerHTML = accounts.map(acc => {
         const isError = acc.status === 'error';
-        const isActive = Boolean(acc.is_active || (!accounts.some(a => a.is_active) && idx === 0));
+        const isActive = Boolean(acc.is_active);
+        const isPending = acc.status === 'pending';
 
         let modelsHtml = '';
         let hasAnyLockout = false;
 
         if (isError) {
-          modelsHtml = `<div style="color: #f87171; font-size: 14px; padding: 10px 0;">⚠️ ${acc.error}</div>`;
+          modelsHtml = '<div class="account-error" style="color: #f87171; font-size: 14px; padding: 10px 0;"></div>';
         } else {
           modelsHtml = (acc.models || []).map(m => {
             const has5h = m.has_5h !== false && m.pool_id !== 'argon';
@@ -2043,13 +2481,29 @@ HTML_DASHBOARD_TEMPLATE = """
             <div class="account-header">
               <div class="email-badge">
                 <span class="status-dot ${isActive ? 'dot-active' : ''}"></span>
-                <span class="email-text" title="${acc.email}">${acc.email}</span>
+                <span class="email-text"></span>
+                <span class="account-note" hidden></span>
                 ${isActive ? '<span class="active-badge">Текущий</span>' : ''}
                 ${hasAnyLockout ? '<span class="cooldown-badge">7дн кулдаун</span>' : ''}
               </div>
-              <span class="status-badge" style="${isError ? 'background:rgba(239,68,68,0.15);color:#f87171;border-color:rgba(239,68,68,0.3);' : ''}">
-                ${isError ? 'ОШИБКА' : 'АКТИВЕН'}
-              </span>
+              <div class="account-actions">
+                <span class="status-badge" style="${isError ? 'background:rgba(239,68,68,0.15);color:#f87171;border-color:rgba(239,68,68,0.3);' : ''}">
+                  ${isError ? 'ОШИБКА' : isPending ? 'ОЖИДАЕТ ОПРОСА' : 'АКТИВЕН'}
+                </span>
+                ${canManageAccounts ? `
+                  ${!isActive ? '<button class="btn btn-primary switch-account-btn" type="button">⚡ Сделать активным</button>' : ''}
+                  <button class="icon-button edit-note" type="button" aria-label="Изменить отметку" title="Изменить отметку">✎</button>
+                  <button class="icon-button toggle-visible" type="button">👁</button>
+                  <button class="icon-button delete-account" type="button" aria-label="Удалить аккаунт" title="Удалить аккаунт">🗑</button>
+                ` : ''}
+              </div>
+              ${canManageAccounts ? `
+                <form class="note-editor" hidden>
+                  <input type="text" aria-label="Отметка аккаунта" placeholder="Введите отметку" maxlength="160">
+                  <button type="submit" class="btn btn-primary">Сохранить</button>
+                  <button type="button" class="btn btn-secondary cancel-note">Отмена</button>
+                </form>
+              ` : ''}
             </div>
             <div class="models-list">
               ${modelsHtml}
@@ -2057,12 +2511,213 @@ HTML_DASHBOARD_TEMPLATE = """
           </div>
         `;
       }).join('');
+
+      Array.from(container.children).forEach((card, index) => {
+        const account = accounts[index];
+        const name = card.querySelector('.email-text');
+        name.textContent = account.email;
+        name.title = account.email;
+        const note = card.querySelector('.account-note');
+        note.hidden = !account.note;
+        note.textContent = account.note ? `(${account.note})` : '';
+        const error = card.querySelector('.account-error');
+        if (error) error.textContent = `⚠️ ${account.error || 'Не удалось загрузить квоты'}`;
+        if (canManageAccounts) bindAccountActions(card, account);
+      });
     }
 
-    function addAccount() {
-      const baseUrl = (location.protocol === 'file:') ? 'http://127.0.0.1:51122' : '';
-      window.open(`${baseUrl}/api/add-account`, '_blank');
-      alert("В новой вкладке откроется окно авторизации Google. После подтверждения вернитесь сюда и нажмите «Обновить».");
+    function bindAccountActions(card, account) {
+      const edit = card.querySelector('.edit-note');
+      const form = card.querySelector('.note-editor');
+      const input = form.querySelector('input');
+      const submit = form.querySelector('[type="submit"]');
+      edit.addEventListener('click', () => {
+        if (isFetching || isManaging) return;
+        const openForm = document.querySelector('.note-editor:not([hidden])');
+        if (openForm && openForm !== form) return;
+        input.value = account.note || '';
+        form.hidden = false;
+        input.focus();
+      });
+      form.querySelector('.cancel-note').addEventListener('click', () => {
+        if (isManaging) return;
+        form.hidden = true;
+        edit.focus();
+      });
+      form.addEventListener('submit', event => {
+        event.preventDefault();
+        saveAccountChange('/api/account/preferences', account.email, { note: input.value }, submit,
+          'Отметка сохранена.');
+      });
+
+      const eye = card.querySelector('.toggle-visible');
+      const visible = account.show_in_swiftbar !== false;
+      const effectivelyVisible = account.is_active || visible;
+      const visibilityLabel = account.is_active ? 'Активный аккаунт всегда виден в SwiftBar' :
+        visible ? 'Скрыть в SwiftBar' : 'Показать в SwiftBar';
+      eye.title = visibilityLabel;
+      eye.setAttribute('aria-label', visibilityLabel);
+      eye.disabled = Boolean(account.is_active);
+      eye.classList.toggle('eye-closed', !effectivelyVisible);
+      eye.addEventListener('click', () => {
+        if (document.querySelector('.note-editor:not([hidden])')) return;
+        saveAccountChange('/api/account/preferences', account.email, { show_in_swiftbar: !visible },
+          eye, visible ? 'Аккаунт скрыт в SwiftBar.' : 'Аккаунт показан в SwiftBar.');
+      });
+
+      const remove = card.querySelector('.delete-account');
+      remove.addEventListener('click', () => {
+        if (isFetching || isManaging || document.querySelector('.note-editor:not([hidden])')) return;
+        const message = account.is_active
+          ? `Удалить ${account.email} из мониторинга QuotaAnalytics? Сессия Antigravity останется открытой.`
+          : `Удалить ${account.email} из дашборда и SwiftBar?`;
+        if (window.confirm(message)) {
+          saveAccountChange('/api/account/delete', account.email, {}, remove, 'Аккаунт удалён.');
+        }
+      });
+
+      const switchBtn = card.querySelector('.switch-account-btn');
+      if (switchBtn) {
+        switchBtn.addEventListener('click', () => {
+          if (isFetching || isManaging || document.querySelector('.note-editor:not([hidden])')) return;
+          openSwitchModal(account.email);
+        });
+      }
+    }
+
+    let pendingSwitchEmail = null;
+
+    function openSwitchModal(email) {
+      if (!canManageAccounts || isManaging) return;
+      const modal = document.getElementById('switch-modal');
+      const emailEl = document.getElementById('switch-modal-email');
+      const confirmBtn = document.getElementById('switch-modal-confirm');
+      const cancelBtn = document.getElementById('switch-modal-cancel');
+      if (!modal || !emailEl) return;
+      pendingSwitchEmail = email;
+      emailEl.textContent = email;
+      if (confirmBtn) {
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = 'Переключить';
+      }
+      if (cancelBtn) cancelBtn.disabled = false;
+      modal.returnValue = '';
+      if (typeof modal.showModal === 'function') {
+        modal.showModal();
+      } else {
+        modal.setAttribute('open', '');
+      }
+    }
+
+    function closeSwitchModal() {
+      const modal = document.getElementById('switch-modal');
+      pendingSwitchEmail = null;
+      if (modal && modal.open) {
+        if (typeof modal.close === 'function') {
+          modal.close('cancel');
+        } else {
+          modal.removeAttribute('open');
+        }
+      }
+    }
+
+    (() => {
+      const modal = document.getElementById('switch-modal');
+      if (modal) {
+        modal.addEventListener('close', () => {
+          modal.returnValue = '';
+          if (!isManaging) pendingSwitchEmail = null;
+        });
+      }
+    })();
+
+    async function confirmSwitchAccount() {
+      if (!pendingSwitchEmail || isManaging) return;
+      const targetEmail = pendingSwitchEmail;
+      const confirmBtn = document.getElementById('switch-modal-confirm');
+      const cancelBtn = document.getElementById('switch-modal-cancel');
+      isManaging = true;
+      if (confirmBtn) {
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = '⏳ Переключение...';
+      }
+      if (cancelBtn) cancelBtn.disabled = true;
+      managementStatus.dataset.error = 'false';
+      managementStatus.textContent = `Переключение активного аккаунта на ${targetEmail}…`;
+      try {
+        const response = await fetch('/api/switch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: targetEmail, dry_run: false, force: false }),
+        });
+        const data = await response.json();
+        if (!response.ok || data.status !== 'ok') {
+          throw new Error(data.message || data.error || 'Не удалось переключить аккаунт.');
+        }
+        isManaging = false;
+        closeSwitchModal();
+        managementStatus.textContent = `Аккаунт переключён на ${data.email || targetEmail}.`;
+        await fetchData(true);
+      } catch (error) {
+        isManaging = false;
+        closeSwitchModal();
+        managementStatus.dataset.error = 'true';
+        managementStatus.textContent = error.message || 'Ошибка переключения аккаунта.';
+      } finally {
+        isManaging = false;
+        if (confirmBtn) {
+          confirmBtn.disabled = false;
+          confirmBtn.textContent = 'Переключить';
+        }
+        if (cancelBtn) cancelBtn.disabled = false;
+      }
+    }
+
+    async function saveAccountChange(path, email, changes, button, message) {
+      if (isFetching || isManaging) return;
+      isManaging = true;
+      button.disabled = true;
+      managementStatus.dataset.error = 'false';
+      managementStatus.textContent = 'Сохранение…';
+      try {
+        const response = await fetch(path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, ...changes }),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error);
+        renderAccounts(data.accounts);
+        managementStatus.textContent = `${message} SwiftBar подхватит изменения при обновлении.`;
+      } catch (error) {
+        managementStatus.dataset.error = 'true';
+        managementStatus.textContent = error.message || 'Не удалось сохранить изменение.';
+      } finally {
+        isManaging = false;
+        button.disabled = false;
+      }
+    }
+
+    async function addAccount() {
+      if (!canManageAccounts) return;
+      const button = document.getElementById('add-account-btn');
+      button.disabled = true;
+      managementStatus.dataset.error = 'false';
+      try {
+        const response = await fetch('/api/add-account', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error);
+        managementStatus.textContent = 'После авторизации Google вернитесь сюда и нажмите «Обновить».';
+      } catch (error) {
+        managementStatus.dataset.error = 'true';
+        managementStatus.textContent = error.message || 'Не удалось открыть авторизацию Google.';
+      } finally {
+        button.disabled = false;
+      }
     }
 
     // =========================================================================
@@ -2315,16 +2970,22 @@ HTML_DASHBOARD_TEMPLATE = """
       renderMonthlyTable(filtered);
     }
 
+    window.__onChartLoaded = () => {
+      if (tokenAnalyticsData) applyDateFilter();
+    };
+
     function renderChart(monthly) {
+      const fallback = document.getElementById('chart-fallback');
+      const canvas = document.getElementById('monthlyChart');
       if (typeof Chart === 'undefined') {
-        const fallback = document.getElementById('chart-fallback');
-        const canvas = document.getElementById('monthlyChart');
-        if (fallback) fallback.style.display = 'block';
-        if (canvas) canvas.style.display = 'none';
+        if (window.__chartLoadFailed) {
+          if (fallback) fallback.style.display = 'block';
+          if (canvas) canvas.style.display = 'none';
+        }
         return;
       }
-
-      const canvas = document.getElementById('monthlyChart');
+      if (fallback) fallback.style.display = 'none';
+      if (canvas) canvas.style.display = 'block';
       if (!canvas) return;
 
       const labels = monthly.map(m => m.period);
@@ -2423,6 +3084,7 @@ HTML_DASHBOARD_TEMPLATE = """
           datasets: datasetsConfig
         },
         options: {
+          animation: false,
           responsive: true,
           maintainAspectRatio: false,
           interaction: {
@@ -2723,11 +3385,167 @@ def load_token_analytics_data():
     return None
 
 
+def trigger_swiftbar_refresh():
+    """Requests an immediate SwiftBar menu refresh in the background on macOS."""
+    if sys.platform != "darwin":
+        return
+    try:
+        subprocess.Popen(
+            ["/usr/bin/open", "-g", "swiftbar://refreshPlugin?name=antigravity_bar.5m.py"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
 class DashboardHTTPHandler(BaseHTTPRequestHandler):
+    def send_json(self, status, payload):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path not in {"/api/account/preferences", "/api/account/delete", "/api/add-account", "/api/switch"}:
+            self.send_json(404, {"error": "Действие не найдено."})
+            return
+
+        port = self.server.server_port if self.server else DASHBOARD_PORT
+        host = self.headers.get("Host")
+        if (host not in {f"127.0.0.1:{port}", f"localhost:{port}"}
+                or self.headers.get("Origin") != f"http://{host}"):
+            self.send_json(403, {"error": "Откройте дашборд через SwiftBar."})
+            return
+        if self.headers.get_content_type() != "application/json":
+            self.send_json(415, {"error": "Ожидаются данные в формате JSON."})
+            return
+
+        if path == "/api/add-account":
+            try:
+                subprocess.Popen(
+                    [sys.executable, os.path.abspath(__file__), "--add"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, start_new_session=True,
+                )
+            except OSError:
+                self.send_json(500, {"error": "Не удалось запустить авторизацию Google."})
+                return
+            self.send_json(202, {"status": "started"})
+            return
+
+        if path == "/api/switch":
+            if account_switcher is None:
+                self.send_json(500, {"status": "error", "error": "Модуль account_switcher недоступен."})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 2048:
+                    raise ValueError
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                if not isinstance(body, dict) or not isinstance(body.get("email"), str) or not body["email"].strip():
+                    raise ValueError
+                target_email = body["email"].strip()
+                dry_run = bool(body.get("dry_run", False))
+                force = bool(body.get("force", False))
+            except (ValueError, UnicodeError):
+                self.send_json(400, {"status": "error", "error": "Укажите корректный email для переключения."})
+                return
+
+            env_root = os.environ.get("ANTIGRAVITY_TEST_ROOT")
+            test_root_path = Path(env_root) if env_root else None
+            try:
+                res = account_switcher.switch_account(
+                    target_email=target_email,
+                    accounts_file=Path(CONFIG_FILE) if test_root_path is None else None,
+                    dry_run=dry_run,
+                    force=force,
+                    test_root=test_root_path,
+                )
+            except Exception as exc:
+                self.send_json(500, {"status": "error", "email": target_email, "error": str(exc), "message": str(exc)})
+                return
+
+            resp_payload = {
+                "status": "ok" if res.success else "error",
+                "email": res.email,
+                "message": res.message,
+                "dry_run": res.dry_run,
+                "phase": res.phase_reached,
+            }
+            if not res.success:
+                resp_payload["error"] = res.error or res.message
+            if res.success and not res.dry_run and test_root_path is None:
+                trigger_swiftbar_refresh()
+            self.send_json(200 if res.success else 400, resp_payload)
+            return
+
+        deleting = path == "/api/account/delete"
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 2048:
+                raise ValueError
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(body, dict) or not isinstance(body.get("email"), str):
+                raise ValueError
+            key = email_key(body["email"])
+            if not key or "@" not in key:
+                raise ValueError
+            settings = {name: body[name] for name in body if name != "email"}
+            if deleting and settings:
+                raise ValueError
+            if not deleting:
+                if not settings or settings.keys() - {"note", "show_in_swiftbar"}:
+                    raise ValueError
+                if "note" in settings:
+                    note = settings["note"]
+                    if not isinstance(note, str) or len(note) > 160:
+                        raise ValueError
+                    settings["note"] = " ".join(note.splitlines()).strip()
+                    settings["note"].encode("utf-8")
+                if "show_in_swiftbar" in settings and not isinstance(settings["show_in_swiftbar"], bool):
+                    raise ValueError
+        except (ValueError, UnicodeError):
+            self.send_json(400, {"error": "Проверьте данные. Отметка должна содержать до 160 символов."})
+            return
+
+        try:
+            with roster_lock(CONFIG_FILE):
+                accounts = load_accounts(strict=True)
+                account = next((row for row in accounts if email_key(row["email"]) == key), None)
+                if account is None:
+                    self.send_json(404, {"error": "Аккаунт уже удалён или не подключён."})
+                    return
+                if deleting:
+                    saved_cache = read_quota_cache()
+                    retained_cache = [row for row in saved_cache if email_key(row["email"]) != key]
+                    if retained_cache != saved_cache:
+                        save_quota_cache(retained_cache)
+                    accounts = [row for row in accounts if email_key(row["email"]) != key]
+                else:
+                    account.update(settings)
+                save_accounts(accounts)
+        except (OSError, ValueError):
+            self.send_json(500, {"error": "Не удалось сохранить список аккаунтов."})
+            return
+
+        try:
+            generate_static_dashboard()
+        except OSError as error:
+            print(f"Unable to update dashboard snapshot: {error}", file=sys.stderr)
+        with roster_lock(CONFIG_FILE):
+            accounts = load_accounts()
+            _touch_active_account_locked(accounts)
+            rows = account_view(read_quota_cache(), accounts)
+        self.send_json(200, {"accounts": rows})
+
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
@@ -2752,20 +3570,12 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             force = query_params.get("refresh", ["false"])[0].lower() in ("true", "1", "yes")
 
             data = get_all_quotas_data(force_refresh=force)
-            active_email = get_active_antigravity_account()
-
-            # Enrich items with is_active flag
-            for acc in data:
-                email = (acc.get("email") or "").strip().lower()
-                acc["is_active"] = bool(active_email and email == active_email.lower())
-
-            # Sort active account to the top
-            data.sort(key=lambda x: 0 if x.get("is_active") else 1)
+            active_email = next((row["email"] for row in data if row["is_active"]), None)
 
             # If force refreshed, keep static dashboard.html synchronized on disk
             if force:
                 try:
-                    generate_static_dashboard(data)
+                    generate_static_dashboard()
                 except Exception:
                     pass
 
@@ -2828,56 +3638,39 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         return
 
 
-def generate_static_dashboard(data=None, output_path=None):
+def generate_static_dashboard(output_path=None):
     """
     Generates a standalone, self-contained dashboard.html file
     with pre-embedded quota data from local cache / live check.
     Zero server processes required.
     """
-    if data is None:
-        data = get_all_quotas_data(force_refresh=False)
-    else:
-        data = list(data)
-
-    active_email = get_active_antigravity_account()
-
-    for acc in data:
-        email = (acc.get("email") or "").strip().lower()
-        acc["is_active"] = bool(active_email and email == active_email.lower())
-        models = acc.get("models", [])
-        for idx, m in enumerate(models):
-            if m.get("pool_id") == "argon":
-                models[idx] = recalculate_cached_argon(m)
-
-    data.sort(key=lambda x: 0 if x.get("is_active") else 1)
-
-    cache_time_str = datetime.now().strftime("%H:%M:%S")
-    if os.path.exists(CACHE_FILE):
-        try:
-            mtime = os.path.getmtime(CACHE_FILE)
-            cache_time_str = datetime.fromtimestamp(mtime).strftime("%H:%M:%S")
-        except Exception:
-            pass
-
-    payload = {
-        "active_email": active_email,
-        "is_cached": True,
-        "cache_time": cache_time_str,
-        "accounts": data,
-        "token_analytics": load_token_analytics_data()
-    }
-
-    embedded_json = json.dumps(payload, ensure_ascii=False)
-    html_content = HTML_DASHBOARD_TEMPLATE.replace(
-        "/*EMBEDDED_DATA_PLACEHOLDER*/ null",
-        embedded_json
-    )
-
+    token_analytics = load_token_analytics_data()
     if not output_path:
         output_path = os.path.join(SCRIPT_DIR, "dashboard.html")
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(html_content)
+    with roster_lock(CONFIG_FILE):
+        accounts = load_accounts()
+        _touch_active_account_locked(accounts)
+        data = account_view(read_quota_cache(), accounts)
+        for account in data:
+            if "models" in account:
+                account["models"] = [recalculate_cached_model(model) for model in account["models"]]
+
+        try:
+            cache_time = datetime.fromtimestamp(os.path.getmtime(CACHE_FILE))
+        except OSError:
+            cache_time = datetime.now()
+        payload = {
+            "active_email": next((row["email"] for row in data if row["is_active"]), None),
+            "is_cached": True,
+            "cache_time": cache_time.strftime("%H:%M:%S"),
+            "accounts": data,
+            "token_analytics": token_analytics,
+        }
+        # A literal '<' in user data could close the script tag even inside a JSON string.
+        embedded_json = json.dumps(payload, ensure_ascii=False).replace("<", r"\u003c")
+        html_content = HTML_DASHBOARD_TEMPLATE.replace("/*EMBEDDED_DATA_PLACEHOLDER*/ null", embedded_json)
+        atomic_write(output_path, html_content)
 
     return output_path
 
@@ -2938,23 +3731,40 @@ def run_dashboard_server(open_browser=True):
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "--add":
+    parser = argparse.ArgumentParser(description="Antigravity Quota Checker & Account Switcher")
+    parser.add_argument("--add", action="store_true", help="Add a new account via Google OAuth flow")
+    parser.add_argument("--list", action="store_true", help="List configured accounts")
+    parser.add_argument("--json", action="store_true", help="Output all quota data in JSON format")
+    parser.add_argument("--dashboard", action="store_true", help="Open Liquid Glass Dashboard in browser")
+    parser.add_argument("--server", action="store_true", help="Run background HTTP server")
+    parser.add_argument("--no-open", action="store_true", help="Do not open browser when starting server")
+    parser.add_argument("--switch", metavar="EMAIL", help="Perform account switch to target email or index")
+    parser.add_argument(
+        "--switch-interactive",
+        metavar="EMAIL",
+        help="Prompt native macOS AppleScript confirmation dialog before switching",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Execute switch in safe simulation mode")
+    parser.add_argument("--force", action="store_true", help="Bypass active streaming socket check if needed")
+    args, _ = parser.parse_known_args()
+
+    if args.add:
         add_account_flow()
         return
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--list":
+    if args.list:
         accounts = load_accounts()
         print(f"\n📋 Подключено аккаунтов: {len(accounts)}")
         for i, acc in enumerate(accounts, 1):
             print(f"  {i}. {acc.get('email')} (добавлен: {acc.get('added_at', 'н/д')})")
         return
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--json":
+    if args.json:
         data = get_all_quotas_data(force_refresh=True)
         print(json.dumps(data, indent=2, ensure_ascii=False))
         return
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--dashboard":
+    if args.dashboard:
         html_file = generate_static_dashboard()
         server_ok = is_dashboard_server_running()
         if not server_ok:
@@ -2970,10 +3780,40 @@ def main():
             webbrowser.open(file_url)
         return
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--server":
-        no_open = "--no-open" in sys.argv
-        run_dashboard_server(open_browser=not no_open)
+    if args.server:
+        run_dashboard_server(open_browser=not args.no_open)
         return
+
+    if args.switch or args.switch_interactive:
+        if account_switcher is None:
+            print("❌ Модуль account_switcher недоступен.")
+            sys.exit(1)
+        target = args.switch_interactive or args.switch
+        interactive = bool(args.switch_interactive)
+        dry_run = bool(args.dry_run)
+        env_root = os.environ.get("ANTIGRAVITY_TEST_ROOT")
+        test_root_path = Path(env_root) if env_root else None
+        is_sim = dry_run or os.environ.get("ANTIGRAVITY_DRY_RUN") == "1"
+        mode_note = " (симуляция / dry-run)" if is_sim else ""
+        print(f"🔄 Выполняется переключение на аккаунт: {target}{mode_note}...")
+        res = account_switcher.switch_account(
+            target_email=str(target),
+            dry_run=dry_run,
+            force=bool(args.force),
+            interactive=interactive,
+            test_root=test_root_path,
+        )
+        if res.success:
+            print(f"\n✅ {res.message}")
+            if res.dry_run:
+                print("   ℹ️  Режим симуляции (dry-run): системные файлы и процессы не изменялись.")
+            elif not interactive and test_root_path is None:
+                trigger_swiftbar_refresh()
+            sys.exit(0)
+        print(f"\n❌ Ошибка переключения: {res.message}")
+        if res.error:
+            print(f"   Детали: {res.error}")
+        sys.exit(1)
 
     accounts = load_accounts()
     if not accounts:

@@ -39,7 +39,7 @@ Developers actively building with **Google Antigravity 2.0** (Google AI Pro, Ult
 • Multi-Account OAuth          • brain/ Transcript Scanner      • Headless VPS & CLI Monitor
 • 5h & 7d Cooldown Pools       • BPE Tokenizer (Qwen2.5)        • Proactive Telegram Alerts
 • macOS SwiftBar Widget        • Two-Tier ReAct Audit           • Warning (≤20%) & Critical (≤5%)
-• Zero-Server Dashboard        • CLI Comparator (report.py)     • Cron-Ready Headless Daemon
+• Local Dashboard              • CLI Comparator (report.py)     • Cron-Ready Headless Daemon
 ```
 
 ---
@@ -58,13 +58,13 @@ Developers actively building with **Google Antigravity 2.0** (Google AI Pro, Ult
 ```text
 ✨ 94% · 4ч 7м
 ─────────────────────────────────────────────
-user1@gmail.com (Active)
+user1 (Active)
    5h:  [████████]  94%  (4h 7m)
    7d:  [████████]  99%  (6d 23h)
-user2@gmail.com
+user2 (Subscription through May 31)
    5h:  [░░░░░░░░]   5%  (1h 23m)
    7d:  [███████░]  84%  (6d 15h)
-user3@gmail.com
+user3
    5h:  [████████] 100%  (4h 59m)
    7d:  [░░░░░░░░]   0%  (2d 1h)  <-- 7-day cooldown highlighted
 ─────────────────────────────────────────────
@@ -75,10 +75,11 @@ user3@gmail.com
 
 ---
 
-### 2. 🪟 Zero-Server Liquid Glass Dashboard
+### 2. 🪟 Liquid Glass Dashboard
 
 An ultra-fast, local web interface displaying all connected profiles and token analytics:
-- **Zero-Server Architecture:** Generates a standalone, static `dashboard.html` in **~1 ms** and opens it directly via `open file://`. No persistent Python HTTP daemon, Node.js server, or open terminal window required.
+- **Local Dashboard:** `--dashboard` opens the interface via the Python server bound to `127.0.0.1:51122`. If the server is unavailable, it opens the saved `dashboard.html` snapshot in read-only mode.
+- **Account Management:** Add or delete monitored accounts, edit notes shown in the dashboard and SwiftBar, and control which profiles appear in the SwiftBar menu. The connected Antigravity account stays visible while active.
 - **Multi-Model Side-by-Side View:** Displays 5h and 7d quota gauges for both **Claude** (Claude 3.7 Sonnet) and **Gemini**.
 - **Widescreen 2x3 Grid:** High-contrast responsive cards with real-time status indicators (Active, Available, Warning, Cooldown).
 - **Integrated Device Token Analytics:**
@@ -124,7 +125,7 @@ For developers running autonomous AI agents, cron jobs, or headless coding workf
   - All core features run natively across Windows (PowerShell/CMD), Linux, and macOS:
     - Multi-account OAuth pairing: `python antigravity-quota-bar/check_quota.py --add`
     - Live terminal quota tables: `python antigravity-quota-bar/check_quota.py`
-    - Zero-Server Liquid Glass Web Dashboard: `python antigravity-quota-bar/check_quota.py --dashboard` (automatically opens in your default browser: Edge, Chrome, Firefox)
+    - Liquid Glass Web Dashboard: `python antigravity-quota-bar/check_quota.py --dashboard` (opens in your default browser)
     - Historical Token & Context Analytics: `python token_analytics/report.py`
 - **macOS Exclusive Feature:**
   - **[SwiftBar](https://swiftbar.app/)** menu bar widget (`antigravity_bar.5m.py`) is designed specifically for the native macOS Menu Bar:

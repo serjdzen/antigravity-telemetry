@@ -66,34 +66,21 @@ def main():
     trigger_background_token_sync()
     accounts_data = check_quota.get_all_quotas_data(force_refresh=True)
 
-    if not accounts_data:
-        print("⚡ Antigravity: нет аккаунтов")
-        print("---")
-        print("ℹ️ Нет подключенных аккаунтов")
-        print(f"➕ Добавить первый аккаунт... | bash=\"python3\" param1=\"{os.path.join(PROJECT_DIR, 'check_quota.py')}\" param2=\"--add\" terminal=true")
-        return
-
     # Keep static dashboard.html synchronized with fresh menubar data
     try:
-        check_quota.generate_static_dashboard(accounts_data)
+        check_quota.generate_static_dashboard()
     except Exception:
         pass
 
     # Detect currently active account in Antigravity desktop app
     active_email = check_quota.get_active_antigravity_account()
-
-    primary_acc = None
-    if active_email:
-        for acc in accounts_data:
-            if acc.get("email", "").lower() == active_email:
-                primary_acc = acc
-                break
-    if not primary_acc:
-        primary_acc = accounts_data[0]
-
-    # Reorder accounts so the active one is always displayed first on top
-    if active_email:
-        accounts_data.sort(key=lambda a: 0 if a.get("email", "").lower() == active_email else 1)
+    active_key = check_quota.email_key(active_email or "")
+    visible_accounts = [
+        acc for acc in accounts_data
+        if check_quota.email_key(acc["email"]) == active_key or acc.get("show_in_swiftbar", True)
+    ]
+    visible_accounts.sort(key=lambda acc: check_quota.email_key(acc["email"]) != active_key)
+    primary_acc = visible_accounts[0] if visible_accounts else {}
 
     bar_title = "Antigravity"
 
@@ -117,15 +104,39 @@ def main():
     print(f"{bar_title} | font=SFPro-Medium size=13")
     print("---")
 
+    py_bin = sys.executable
+    add_script = os.path.join(PROJECT_DIR, "check_quota.py")
+
     # Dropdown content (crisp dark text for macOS Light & Dark Mode)
-    for acc in accounts_data:
-        email = acc.get("email", "unknown")
-        is_active = bool(active_email and email.lower() == active_email.lower())
+    if not visible_accounts:
+        print("ℹ️ Все аккаунты скрыты" if accounts_data else "ℹ️ Нет подключенных аккаунтов")
+    for acc in visible_accounts:
+        email = acc["email"]
+        is_active = check_quota.email_key(email) == active_key
+        label = email[:-len("@gmail.com")] if email.lower().endswith("@gmail.com") else email
+        note = acc.get("note", "")
+        if note:
+            safe_note = " ".join(note.splitlines()).replace("|", "｜")
+            label = f"{label} ({safe_note})"
         badge = " (Активен)" if is_active else ""
         if acc.get("cached_fallback"):
             badge += " (кэш)"
 
-        print(f"{email}{badge} | font=SFPro-Bold size=13 color={'#0284c7' if is_active else '#000000'}")
+        if is_active:
+            action = (
+                'bash="/usr/bin/osascript" param1="-e" '
+                'param2="display notification \\"Аккаунт уже активен\\" with title \\"Antigravity Account Switcher\\"" '
+                'terminal=false'
+            )
+        else:
+            target_param = check_quota.email_key(email)
+            action = (
+                f'bash="{py_bin}" param1="{add_script}" '
+                f'param2="--switch-interactive" param3="{target_param}" '
+                'terminal=false refresh=true'
+            )
+
+        print(f"{label}{badge} | font=SFPro-Bold size=13 color={'#0284c7' if is_active else '#000000'} {action}")
 
         if acc.get("status") == "error":
             print(f"   ⚠️ {acc.get('error')} | color=#dc2626 size=12 trim=false")
@@ -188,9 +199,7 @@ def main():
     print("---")
 
     # Actions
-    py_bin = sys.executable
     print("🔄 Обновить сейчас | refresh=true")
-    add_script = os.path.join(PROJECT_DIR, "check_quota.py")
     print(f"➕ Добавить аккаунт... | bash=\"{py_bin}\" param1=\"{add_script}\" param2=\"--add\" terminal=true")
     print(f"🌐 Открыть Liquid Glass Dashboard | bash=\"{py_bin}\" param1=\"{add_script}\" param2=\"--dashboard\" terminal=false")
 
