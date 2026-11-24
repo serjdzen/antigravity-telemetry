@@ -264,6 +264,35 @@ class AccountManagementTest(unittest.TestCase):
         self.assertLess(restored_output.index(f"{SECOND} (Активен)"), restored_output.index(third))
         self.assertLess(restored_output.index(third), restored_output.index("\nprimary |"))
 
+    def test_argon_is_excluded_from_parsing_cache_swiftbar_and_dashboard(self):
+        parsed = check_quota.parse_quota_groups([
+            {"displayName": "Gemini Models", "buckets": [{"displayName": "Five Hour Limit Remaining", "remainingFraction": 0.9}]},
+            {"displayName": "Claude and GPT models", "buckets": [{"displayName": "Five Hour Limit Remaining", "remainingFraction": 1.0}]},
+            {"displayName": "Gemini 4 Argon", "buckets": [{"displayName": "Gemini 4 Argon Weekly Limit", "remainingFraction": 0.22}]},
+        ])
+        self.assertEqual([m["pool_id"] for m in parsed], ["gemini", "claude"])
+
+        stale_argon = {"name": "Gemini 4 Argon", "pool_id": "argon", "percentage": 22, "weekly_percentage": 22, "weekly_reset": "5д"}
+        row_with_argon = quota(FIRST)
+        row_with_argon["models"].append(stale_argon)
+        self.cache.write_text(json.dumps([row_with_argon, quota(SECOND, 79)]))
+
+        merged = check_quota.merge_quota_results([quota(SECOND, 79)], [row_with_argon])
+        self.assertFalse(any(m.get("pool_id") == "argon" for m in merged[0]["models"]))
+
+        _, payload = self.request("/api/quotas")
+        api_models = json.loads(payload)["accounts"][0]["models"]
+        self.assertFalse(any(m.get("pool_id") == "argon" for m in api_models))
+
+        output = self.plugin_output()
+        self.assertNotIn("Argon", output)
+        html = self.dashboard.read_text(encoding="utf-8")
+        marker = "const EMBEDDED_DATA = "
+        embedded_line = next(line for line in html.splitlines() if marker in line)
+        embedded_json = embedded_line.split(marker, 1)[1].rstrip(";")
+        static_models = [m for acc in json.loads(embedded_json)["accounts"] for m in acc.get("models", [])]
+        self.assertFalse(any(m.get("pool_id") == "argon" for m in static_models))
+
 
 if __name__ == "__main__":
     unittest.main()

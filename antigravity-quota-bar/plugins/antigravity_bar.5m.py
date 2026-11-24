@@ -142,14 +142,14 @@ def main():
             print(f"   ⚠️ {acc.get('error')} | color=#dc2626 size=12 trim=false")
         else:
             for model in acc.get("models", []):
-                # Only show Gemini and Argon (skip Claude and image pools)
-                if model.get("pool_id") in ("image", "claude") or "claude" in model.get("name", "").lower():
+                # Only show Gemini (skip Claude, image, and legacy Argon pools)
+                if model.get("pool_id") in ("image", "claude", "argon") or any(
+                    kw in model.get("name", "").lower() for kw in ("claude", "argon")
+                ):
                     continue
 
-                is_argon = model.get("pool_id") == "argon" or "argon" in model.get("name", "").lower()
-
                 # 1. 5-hour quota row (only for models with 5h session pool)
-                if not is_argon and model.get("has_5h", True):
+                if model.get("has_5h", True):
                     m_pct = model.get("percentage", 100)
                     m_reset = model.get("reset", "готов")
                     m_frac = model.get("fraction", 1.0)
@@ -192,7 +192,7 @@ def main():
                 else:
                     c_w = " color=#000000"
 
-                row_w = f"   Argon: [{bar_w}] {w_pct:>3}%  ({w_reset})" if is_argon else f"   7дн:   [{bar_w}] {w_pct:>3}%  ({w_reset})"
+                row_w = f"   7дн:   [{bar_w}] {w_pct:>3}%  ({w_reset})"
                 print(f"{row_w} | font=Menlo size=12 trim=false{c_w}")
 
     # Separator before actions

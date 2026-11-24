@@ -332,20 +332,20 @@ def show_mac_confirmation_dialog(
     if is_mock_process_enabled(dry_run):
         return _MOCK_STATE.dialog_confirmed
 
-    body_text = f"Действительно ли вы хотите переключить Antigravity на:\n{email}?"
+    body_text = f"Переключить Antigravity на:\n{email}?"
     if quota_summary:
         body_text += f"\n\nТекущие лимиты профиля:\n{quota_summary}"
-    body_text += "\n\nAntigravity IDE будет безопасно перезапущена."
+    body_text += "\n\nAntigravity будет безопасно перезапущен."
 
     # Escape quotes for AppleScript string literal
     safe_body = body_text.replace('\\', '\\\\').replace('"', '\\"')
 
     script = (
         f'display dialog "{safe_body}" '
-        f'with title "Переключение аккаунта Antigravity" '
+        f'with title "Переключение аккаунта" '
         f'buttons {{"Отмена", "Переключить"}} '
         f'default button "Переключить" '
-        f'with icon caution'
+        f'cancel button "Отмена"'
     )
 
     code, out, _ = run_applescript(script, timeout_sec=timeout_sec)

@@ -487,6 +487,16 @@ class TestTier1FeaturesInIsolation(BaseIsolatedTestCase):
         )
         self.assertFalse(rejected)
 
+        os.environ["PROCESS_MOCK"] = "0"
+        os.environ["ANTIGRAVITY_DRY_RUN"] = "0"
+        os.environ.pop("ANTIGRAVITY_TEST_ROOT", None)
+        with patch("account_switcher.process.run_applescript", return_value=(0, "button returned:Переключить", "")) as mock_as:
+            ok = show_mac_confirmation_dialog(email="target@example.com", dry_run=False)
+        self.assertTrue(ok)
+        script_arg = mock_as.call_args.args[0]
+        self.assertNotIn("with icon", script_arg)
+        self.assertNotIn("IDE", script_arg)
+
     def test_f17_swiftbar_active_account_badge_and_alert(self):
         """Feature 17: SwiftBar Active Account Badge and current user detection."""
         active = get_active_account(test_root=self.test_root)

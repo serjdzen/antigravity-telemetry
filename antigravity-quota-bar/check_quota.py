@@ -185,6 +185,17 @@ def _touch_active_account_locked(accounts, active_email=None):
     return True
 
 
+def _is_argon_model(model_dict):
+    """Identifies legacy separate Argon quota entries after Argon merged into Gemini Models."""
+    if not isinstance(model_dict, dict):
+        return False
+    return model_dict.get("pool_id") == "argon" or "argon" in (model_dict.get("name") or "").lower()
+
+
+def _filter_active_models(models):
+    return [m for m in (models or []) if not _is_argon_model(m)]
+
+
 def account_view(rows, accounts):
     """Join the latest settings with quota data, keeping the roster authoritative and MRU-sorted."""
     quota_fields = ("status", "models", "error", "error_type", "cached_fallback", "transient_error")
@@ -205,6 +216,8 @@ def account_view(rows, accounts):
             **{field: row[field] for field in quota_fields if field in row},
             **preferences,
         }
+        if "models" in item:
+            item["models"] = _filter_active_models(item["models"])
         dt = _parse_mru_datetime(account.get("last_used_at"))
         mru_key = -int((dt - _EPOCH).total_seconds() * 1_000_000) if dt is not None else 0
         ranked.append(((0 if item["is_active"] else 1, 0 if dt is not None else 1, mru_key, idx), item))
@@ -477,7 +490,7 @@ def discover_local_language_server(force=False):
 
 def query_local_quota_summary():
     """
-    Queries local Antigravity Language Server for quota summary (including Gemini 4 Argon).
+    Queries local Antigravity Language Server for quota summary.
     Returns list of quota groups or None.
     """
     port, token = discover_local_language_server()
@@ -557,9 +570,8 @@ def format_reset_time(iso_time_str):
 def parse_quota_groups(groups):
     """
     Parses structured quota groups into models list:
-    - Gemini Models (excludes argon to avoid name collisions)
+    - Gemini Models (now includes Gemini 4 Argon / Orchestrator)
     - Claude and GPT models
-    - Gemini 4 Argon (weekly pool)
     """
     models = []
 
@@ -614,168 +626,16 @@ def parse_quota_groups(groups):
     if c_m:
         models.append(c_m)
 
-    a_m = parse_group(["argon"], "Gemini 4 Argon", "argon", "⚡")
-    if a_m:
-        models.append(a_m)
-
     return models
-
-
-ANOMALY_RESET_SKEW_SECONDS = 120
-FULL_QUOTA_FRACTION_THRESHOLD = 0.999
-PRIMARY_POOL_IDS = ("gemini", "claude")
-
-
-def _parse_iso_utc(iso_str):
-    """Parses an ISO-8601 timestamp string into a UTC-aware datetime, or returns None."""
-    if not iso_str:
-        return None
-    try:
-        clean_ts = str(iso_str).replace("Z", "+00:00")
-        dt = datetime.fromisoformat(clean_ts)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
-def reset_argon_model(model_dict):
-    """Returns a copy of a cached Argon model reset to 100% ('готов') with cleared timers."""
-    if not model_dict or model_dict.get("pool_id") != "argon":
-        return model_dict
-    m = dict(model_dict)
-    m["percentage"] = 100
-    m["fraction"] = 1.0
-    m["reset"] = "готов"
-    m["weekly_percentage"] = 100
-    m["weekly_fraction"] = 1.0
-    m["weekly_reset"] = "готов"
-    m["weekly_reset_iso"] = None
-    m["reset_iso"] = None
-    return m
-
-
-def _has_full_primary_quota(model_dict):
-    """Checks that a primary pool reports 100% 5h/7d quota from a reliable weekly source."""
-    has_reliable_weekly = (
-        model_dict.get("has_weekly") is True
-        or _parse_iso_utc(model_dict.get("weekly_reset_iso")) is not None
-    )
-    if not has_reliable_weekly:
-        return False
-    pct_5h = model_dict.get("percentage", 100)
-    frac_5h = model_dict.get("fraction", 1.0)
-    pct_7d = model_dict.get("weekly_percentage", 100)
-    frac_7d = model_dict.get("weekly_fraction", 1.0)
-    return (
-        pct_5h == 100
-        and pct_7d == 100
-        and (frac_5h is None or frac_5h >= FULL_QUOTA_FRACTION_THRESHOLD)
-        and (frac_7d is None or frac_7d >= FULL_QUOTA_FRACTION_THRESHOLD)
-    )
-
-
-def detect_anomalous_pool_reset(cached_acc, fresh_res, now=None, skew_seconds=ANOMALY_RESET_SKEW_SECONDS):
-    """
-    Detects an early/anomalous Google quota reset on primary pools (Gemini/Claude)
-    between cached_acc and fresh_res so cached Argon can also be reset.
-
-    Requires ALL present primary pools in fresh_res to be 100% with valid weekly_reset_iso
-    (ignoring fetchAvailableModels fallback and cached_fallback), and at least one primary
-    pool to have transitioned from <100% before its cached reset window expired.
-    """
-    if not cached_acc or not fresh_res:
-        return False
-    if fresh_res.get("status") != "ok" or fresh_res.get("cached_fallback"):
-        return False
-
-    fresh_pools = {
-        m.get("pool_id"): m
-        for m in fresh_res.get("models", [])
-        if m.get("pool_id") in PRIMARY_POOL_IDS
-    }
-    if not fresh_pools:
-        return False
-    if not all(_has_full_primary_quota(m) for m in fresh_pools.values()):
-        return False
-
-    prev_pools = {
-        m.get("pool_id"): m
-        for m in cached_acc.get("models", [])
-        if m.get("pool_id") in PRIMARY_POOL_IDS
-    }
-    now_utc = now or datetime.now(timezone.utc)
-    skew = timedelta(seconds=skew_seconds)
-
-    for pid, curr_m in fresh_pools.items():
-        prev_m = prev_pools.get(pid)
-        if not prev_m:
-            continue
-
-        prev_w_pct = prev_m.get("weekly_percentage", 100)
-        prev_w_frac = prev_m.get("weekly_fraction", 1.0)
-        prev_w_dt = _parse_iso_utc(prev_m.get("weekly_reset_iso"))
-        curr_w_dt = _parse_iso_utc(curr_m.get("weekly_reset_iso"))
-
-        had_weekly_usage = prev_w_pct < 100 or (
-            prev_w_frac is not None and prev_w_frac < FULL_QUOTA_FRACTION_THRESHOLD
-        )
-        if had_weekly_usage and prev_w_dt is not None and prev_w_dt > now_utc + skew:
-            return True
-
-        prev_5h_pct = prev_m.get("percentage", 100)
-        prev_5h_frac = prev_m.get("fraction", 1.0)
-        prev_5h_dt = _parse_iso_utc(prev_m.get("reset_iso"))
-        had_5h_usage = prev_5h_pct < 100 or (
-            prev_5h_frac is not None and prev_5h_frac < FULL_QUOTA_FRACTION_THRESHOLD
-        )
-        if (
-            had_5h_usage
-            and prev_5h_dt is not None
-            and prev_5h_dt > now_utc + skew
-            and prev_w_dt is not None
-            and curr_w_dt is not None
-            and curr_w_dt > prev_w_dt + skew
-        ):
-            return True
-
-    return False
-
-
-def recalculate_cached_argon(model_dict):
-    """
-    Recalculates dynamic reset countdown for cached Argon quota.
-    If weekly window has expired, resets quota to 100% ('готов').
-    """
-    if not model_dict or model_dict.get("pool_id") != "argon":
-        return model_dict
-
-    m = dict(model_dict)
-    w_iso = m.get("weekly_reset_iso") or m.get("reset_iso")
-    target = _parse_iso_utc(w_iso)
-    if target is None:
-        return m
-
-    total_seconds = int((target - datetime.now(timezone.utc)).total_seconds())
-    if total_seconds <= 0:
-        return reset_argon_model(m)
-
-    updated_time_str = format_reset_time(w_iso)
-    m["reset"] = updated_time_str
-    m["weekly_reset"] = updated_time_str
-    return m
 
 
 def recalculate_cached_model(model_dict):
     """
-    Recalculates dynamic reset countdowns for any cached model (Gemini, Claude, Argon).
+    Recalculates dynamic reset countdowns for any cached model (Gemini, Claude).
     If reset window has passed, marks quota as 'готов'.
     """
     if not model_dict or not isinstance(model_dict, dict):
         return model_dict
-    if model_dict.get("pool_id") == "argon":
-        return recalculate_cached_argon(model_dict)
 
     m = dict(model_dict)
     # Recalculate 5h session reset
@@ -812,7 +672,7 @@ def fetch_account_quota(acc):
     is_active = bool(active_email and email.strip().lower() == active_email.strip().lower())
 
     if is_active:
-        # Fast local query via Language Server (sub-millisecond, returns Gemini, Claude, and Gemini 4 Argon)
+        # Fast local query via Language Server (sub-millisecond, returns Gemini and Claude)
         local_groups = query_local_quota_summary()
         if local_groups:
             parsed_models = parse_quota_groups(local_groups)
@@ -842,14 +702,6 @@ def fetch_account_quota(acc):
             groups = summary_data["response"].get("groups", [])
         if groups:
             acc_data["models"] = parse_quota_groups(groups)
-
-    if is_active and not any(m.get("pool_id") == "argon" for m in acc_data["models"]):
-        # Ensure active account always retains Argon from local Language Server
-        local_groups = query_local_quota_summary()
-        if local_groups:
-            argon_m = next((m for m in parse_quota_groups(local_groups) if m.get("pool_id") == "argon"), None)
-            if argon_m:
-                acc_data["models"].append(argon_m)
 
     # 2. Fallback to fetchAvailableModels if summary returned nothing
     if not acc_data["models"]:
@@ -995,7 +847,10 @@ def merge_quota_results(results, previous):
                 should_use_cache = True
 
             if should_use_cache and cached_acc and cached_acc.get("models"):
-                updated_models = [recalculate_cached_model(m) for m in cached_acc.get("models", [])]
+                updated_models = [
+                    recalculate_cached_model(m)
+                    for m in _filter_active_models(cached_acc.get("models", []))
+                ]
                 results[i] = {
                     **cached_acc,
                     "status": "ok",
@@ -1005,30 +860,17 @@ def merge_quota_results(results, previous):
                 }
                 res = results[i]
 
-        # Smart Argon Persistence: preserve cached Argon for ANY account that previously had it,
-        # unless fresh data in this cycle already contains Argon.
-        # If Google unexpectedly reset primary pools (Gemini/Claude) early, reset Argon too.
-        if not any(m.get("pool_id") == "argon" for m in res.get("models", [])):
-            cached_acc = prev_cache.get(acc_key)
-            if cached_acc:
-                cached_argon = next((m for m in cached_acc.get("models", []) if m.get("pool_id") == "argon"), None)
-                if cached_argon:
-                    already_full = (
-                        cached_argon.get("weekly_percentage", 100) == 100
-                        and cached_argon.get("percentage", 100) == 100
-                        and not cached_argon.get("weekly_reset_iso")
-                    )
-                    if not already_full and detect_anomalous_pool_reset(cached_acc, res):
-                        updated_argon = reset_argon_model(cached_argon)
-                    else:
-                        updated_argon = recalculate_cached_argon(cached_argon)
-                    res.setdefault("models", []).append(updated_argon)
+        if "models" in res and isinstance(res["models"], list):
+            res["models"] = _filter_active_models(res["models"])
 
     if not any(row.get("status") == "ok" for row in results):
         results = [
             {
                 **cached,
-                "models": [recalculate_cached_model(model) for model in cached.get("models", [])],
+                "models": [
+                    recalculate_cached_model(model)
+                    for model in _filter_active_models(cached.get("models", []))
+                ],
                 "cached_fallback": True,
             } if (cached := prev_cache.get(email_key(row["email"]))) else row
             for row in results
@@ -1083,15 +925,7 @@ def parse_and_display_quota(account_email, data_or_acc):
         print(account_header)
         print("─" * 68)
         for m in data_or_acc.get("models", []):
-            if m.get("pool_id") in ("image", "claude") or "claude" in m.get("name", "").lower():
-                continue
-            is_argon = m.get("pool_id") == "argon" or "argon" in m.get("name", "").lower()
-            if is_argon:
-                w_pct = m.get("weekly_percentage", 100)
-                w_reset = m.get("weekly_reset", "готов")
-                w_frac = m.get("weekly_fraction", 1.0)
-                bar_w = render_progress_bar(w_frac, width=5)
-                print(f"  ⚡ Argon: {bar_w}  ({w_reset})")
+            if m.get("pool_id") in ("image", "claude") or "claude" in m.get("name", "").lower() or _is_argon_model(m):
                 continue
 
             bar_5h = render_progress_bar(m.get("fraction", 1.0), width=5)
@@ -2258,8 +2092,8 @@ HTML_DASHBOARD_TEMPLATE = """
   </div>
 
   <dialog id="switch-modal" aria-labelledby="switch-modal-title">
-    <h2 id="switch-modal-title">Переключение аккаунта Antigravity</h2>
-    <p>Переключить активный аккаунт Antigravity на <span class="modal-email" id="switch-modal-email"></span>? Antigravity IDE будет безопасно перезапущена.</p>
+    <h2 id="switch-modal-title">Переключение аккаунта</h2>
+    <p>Переключить активный аккаунт Antigravity на <span class="modal-email" id="switch-modal-email"></span>? Antigravity будет безопасно перезапущен.</p>
     <div class="modal-actions">
       <button type="button" class="btn btn-secondary" id="switch-modal-cancel" onclick="closeSwitchModal()" autofocus>Отмена</button>
       <button type="button" class="btn btn-primary" id="switch-modal-confirm" onclick="confirmSwitchAccount()">Переключить</button>
@@ -2382,8 +2216,10 @@ HTML_DASHBOARD_TEMPLATE = """
         if (isError) {
           modelsHtml = '<div class="account-error" style="color: #f87171; font-size: 14px; padding: 10px 0;"></div>';
         } else {
-          modelsHtml = (acc.models || []).map(m => {
-            const has5h = m.has_5h !== false && m.pool_id !== 'argon';
+          modelsHtml = (acc.models || [])
+            .filter(m => m.pool_id !== 'argon' && !(m.name || '').toLowerCase().includes('argon'))
+            .map(m => {
+            const has5h = m.has_5h !== false;
 
             // 1. 5-hour session pool
             const pct5h = Number(m.percentage ?? 100);
@@ -2427,7 +2263,7 @@ HTML_DASHBOARD_TEMPLATE = """
               pctColor7d = 'color: #fbbf24;';
             }
 
-            const modelIcon = m.icon || (m.pool_id === 'argon' ? '⚡' : (m.name.toLowerCase().includes('claude') ? '🧠' : '✨'));
+            const modelIcon = m.icon || (m.name.toLowerCase().includes('claude') ? '🧠' : '✨');
 
             return `
               <div class="model-row">
