@@ -207,6 +207,7 @@ def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
                 cached_entry['project'] = projects_map[c_id]
             elif not cached_entry.get('project') or cached_entry.get('project') == '—':
                 cached_entry['project'] = infer_project_name(cached_entry.get('title')) or infer_project_name(cached_entry.get('first_req')) or '—'
+            cached_entry['provider'] = 'antigravity'
             results[c_id] = cached_entry
             cached_sessions += 1
             continue
@@ -303,6 +304,7 @@ def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
         proj_val = projects_map.get(c_id) or infer_project_name(titles_map.get(c_id)) or infer_project_name(first_req) or '—'
         entry = {
             'id': c_id,
+            'provider': 'antigravity',
             'title': titles_map.get(c_id) or first_req or "(нет темы)",
             'project': proj_val,
             'first_req': first_req or "(нет текста запроса)",
@@ -321,6 +323,7 @@ def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
     for c_id, cached_entry in cache.items():
         if c_id not in results:
             entry_copy = dict(cached_entry)
+            entry_copy['provider'] = 'antigravity'
             entry_copy['deleted_from_disk'] = True
             if c_id in titles_map:
                 entry_copy['title'] = titles_map[c_id]
@@ -349,3 +352,47 @@ def scan_conversations(brain_dir=None, cache_path=None, force_refresh=False):
         print(f"Warning: Failed to save cache: {e}")
 
     return results, cached_sessions, updated_sessions
+
+
+def scan_all_sessions(
+    brain_dir=None,
+    codex_dir=None,
+    cache_path=None,
+    codex_cache_path=None,
+    force_refresh=False,
+):
+    """
+    Scans both Antigravity brain/ and local Codex CLI ~/.codex/sessions/ into a single dict.
+    """
+    try:
+        from .codex_scanner import scan_codex_sessions
+    except ImportError:
+        from core.codex_scanner import scan_codex_sessions
+
+    ag_sessions = {}
+    ag_cached = 0
+    ag_updated = 0
+    ag_missing = False
+    try:
+        ag_sessions, ag_cached, ag_updated = scan_conversations(
+            brain_dir=brain_dir,
+            cache_path=cache_path,
+            force_refresh=force_refresh,
+        )
+    except FileNotFoundError:
+        ag_missing = True
+
+    cdx_sessions, cdx_cached, cdx_updated = scan_codex_sessions(
+        codex_dir=codex_dir,
+        cache_path=codex_cache_path,
+        force_refresh=force_refresh,
+    )
+
+    if ag_missing and not cdx_sessions:
+        target_brain = brain_dir or os.path.expanduser('~/.gemini/antigravity/brain')
+        raise FileNotFoundError(f"Brain directory not found at: {target_brain}")
+
+    combined = {}
+    combined.update(ag_sessions)
+    combined.update(cdx_sessions)
+    return combined, ag_cached + cdx_cached, ag_updated + cdx_updated

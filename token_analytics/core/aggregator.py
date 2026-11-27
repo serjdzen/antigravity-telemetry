@@ -126,6 +126,17 @@ def get_overall_summary(sessions):
         'tot_user_prompts': tot_prompts
     }
 
+def filter_sessions_by_provider(sessions, provider='all'):
+    """Filters unified sessions dictionary by provider ('all', 'antigravity', 'codex')."""
+    if not provider or provider == 'all':
+        return sessions
+    return {
+        c_id: s_data
+        for c_id, s_data in sessions.items()
+        if s_data.get('provider', 'antigravity') == provider
+    }
+
+
 def get_top_conversations(sessions, limit=15, sort_by='unique_tok'):
     """
     Returns top conversations sorted by unique tokens or context.
@@ -144,7 +155,9 @@ def get_top_conversations(sessions, limit=15, sort_by='unique_tok'):
         uniq = u + m_tok + th + tl
 
         conv_list.append({
-            'id': c_id,
+            'id': s_data.get('id', c_id),
+            'provider': s_data.get('provider', 'antigravity'),
+            'is_subagent': bool(s_data.get('is_subagent', False)),
             'title': s_data.get('title') or s_data.get('first_req', '(нет темы)'),
             'project': s_data.get('project', '—'),
             'start_date': dates[0] if dates else 'unknown',

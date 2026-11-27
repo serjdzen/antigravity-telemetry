@@ -18,9 +18,15 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-from core.scanner import scan_conversations
-from core.aggregator import aggregate_by_period, get_overall_summary, get_top_conversations
+from core.scanner import scan_all_sessions
+from core.aggregator import (
+    aggregate_by_period,
+    filter_sessions_by_provider,
+    get_overall_summary,
+    get_top_conversations,
+)
 from core.comparator import compute_period_comparisons, evaluate_quota_hypothesis
+from sync_cache import _build_provider_slice, build_export_payload
 
 def format_tokens(num):
     if num >= 1_000_000_000:
@@ -43,18 +49,21 @@ def main():
                         help="Force full re-scan of brain/ bypassing the incremental cache")
     parser.add_argument('--top', type=int, default=20,
                         help="Display top N largest sessions (default: 20)")
+    parser.add_argument('--provider', choices=['all', 'antigravity', 'codex'], default='all',
+                        help="Filter analytics by agent provider: all (default), antigravity, or codex")
     parser.add_argument('--json-out', type=str, default=None,
                         help="Output path for JSON report (default: token_analytics/antigravity_token_analysis.json)")
 
     args = parser.parse_args()
 
     print(f"\n================================================================================")
-    print(f"            ANTIGRAVITY 2.0 TOKEN ANALYTICS & AUDIT ENGINE                     ")
+    print(f"            ANTIGRAVITY & CODEX TOKEN ANALYTICS & AUDIT ENGINE                  ")
     print(f"================================================================================")
     print("Scanning sessions and applying incremental cache...")
 
-    sessions, cached_cnt, updated_cnt = scan_conversations(force_refresh=args.refresh)
-    print(f"✓ Total sessions processed: {len(sessions)} (Cached: {cached_cnt}, Re-scanned: {updated_cnt})\n")
+    all_sessions, cached_cnt, updated_cnt = scan_all_sessions(force_refresh=args.refresh)
+    sessions = filter_sessions_by_provider(all_sessions, args.provider)
+    print(f"✓ Total sessions processed: {len(all_sessions)} (Showing [{args.provider}]: {len(sessions)}, Cached: {cached_cnt}, Re-scanned: {updated_cnt})\n")
 
     summary = get_overall_summary(sessions)
     aggregated = aggregate_by_period(sessions, period_type=args.period)
@@ -155,16 +164,17 @@ def main():
 
     # 5. Export JSON
     out_path = args.json_out
+    if args.provider != 'all' and not out_path:
+        print(f"ℹ️  Единый JSON не перезаписан, так как активен фильтр --provider {args.provider}.\n")
+        return
+
     if not out_path:
         out_path = os.path.join(current_dir, 'antigravity_token_analysis.json')
 
-    export_payload = {
-        'summary': summary,
-        'monthly': comparisons if args.period == 'month' else compute_period_comparisons(aggregate_by_period(sessions, 'month'), summary),
-        'weekly': comparisons if args.period == 'week' else compute_period_comparisons(aggregate_by_period(sessions, 'week'), summary),
-        'daily': comparisons if args.period == 'day' else compute_period_comparisons(aggregate_by_period(sessions, 'day'), summary),
-        'top_conversations': get_top_conversations(sessions, limit=50)
-    }
+    if args.provider == 'all':
+        export_payload = build_export_payload(all_sessions, top_limit=50)
+    else:
+        export_payload = _build_provider_slice(sessions, top_limit=50)
 
     try:
         with open(out_path, 'w', encoding='utf-8') as f:

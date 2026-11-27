@@ -15,8 +15,13 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-from core.scanner import scan_conversations
-from core.aggregator import aggregate_by_period, get_overall_summary, get_top_conversations
+from core.scanner import scan_all_sessions
+from core.aggregator import (
+    aggregate_by_period,
+    filter_sessions_by_provider,
+    get_overall_summary,
+    get_top_conversations,
+)
 from core.comparator import compute_period_comparisons
 
 
@@ -48,18 +53,39 @@ def _atomic_write_json(path, payload):
         raise
 
 
+def _build_provider_slice(sessions, top_limit=50):
+    """Builds summary, period comparisons, and top sessions for a session subset."""
+    summary = get_overall_summary(sessions)
+    return {
+        'summary': summary,
+        'monthly': compute_period_comparisons(aggregate_by_period(sessions, 'month'), summary),
+        'weekly': compute_period_comparisons(aggregate_by_period(sessions, 'week'), summary),
+        'daily': compute_period_comparisons(aggregate_by_period(sessions, 'day'), summary),
+        'top_conversations': get_top_conversations(sessions, limit=top_limit),
+    }
+
+
+def build_export_payload(sessions, top_limit=50):
+    """Builds unified export JSON preserving top-level totals plus by_provider slices."""
+    payload = _build_provider_slice(sessions, top_limit=top_limit)
+    payload['by_provider'] = {
+        'antigravity': _build_provider_slice(
+            filter_sessions_by_provider(sessions, 'antigravity'),
+            top_limit=top_limit,
+        ),
+        'codex': _build_provider_slice(
+            filter_sessions_by_provider(sessions, 'codex'),
+            top_limit=top_limit,
+        ),
+    }
+    return payload
+
+
 def sync():
     try:
-        sessions, _, _ = scan_conversations(force_refresh=False)
-        summary = get_overall_summary(sessions)
+        sessions, _, _ = scan_all_sessions(force_refresh=False)
         out_path = os.path.join(current_dir, 'antigravity_token_analysis.json')
-        export_payload = {
-            'summary': summary,
-            'monthly': compute_period_comparisons(aggregate_by_period(sessions, 'month'), summary),
-            'weekly': compute_period_comparisons(aggregate_by_period(sessions, 'week'), summary),
-            'daily': compute_period_comparisons(aggregate_by_period(sessions, 'day'), summary),
-            'top_conversations': get_top_conversations(sessions, limit=50)
-        }
+        export_payload = build_export_payload(sessions, top_limit=50)
         _atomic_write_json(out_path, export_payload)
         return 0
     except Exception:

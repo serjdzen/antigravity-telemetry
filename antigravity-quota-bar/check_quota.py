@@ -1939,10 +1939,15 @@ HTML_DASHBOARD_TEMPLATE = """
           <div class="analytics-icon-badge">🧠</div>
           <div>
             <div class="analytics-title">Device Token Analytics</div>
-            <div class="analytics-subtitle" id="analytics-period-subtitle">Аналитика локальных сессий устройства • ~/.gemini/antigravity/brain/</div>
+            <div class="analytics-subtitle" id="analytics-period-subtitle">Аналитика локальных сессий • Antigravity + Codex</div>
           </div>
         </div>
         <div class="analytics-meta-badges">
+          <div class="period-presets" id="provider-filter-presets">
+            <button class="preset-btn active" onclick="setAnalyticsProvider('all')" id="btn-prov-all">Все агенты</button>
+            <button class="preset-btn" onclick="setAnalyticsProvider('antigravity')" id="btn-prov-antigravity">Antigravity</button>
+            <button class="preset-btn" onclick="setAnalyticsProvider('codex')" id="btn-prov-codex">Codex</button>
+          </div>
           <span class="meta-pill" id="meta-sessions-count">0 сессий</span>
           <span class="meta-pill" id="meta-active-days">0 активных дней</span>
           <span class="meta-pill" id="meta-period-range">-</span>
@@ -2114,7 +2119,13 @@ HTML_DASHBOARD_TEMPLATE = """
 
     function analyticsSignature(tdata) {
       const s = tdata && tdata.summary;
-      return s ? `${s.last_date || ''}|${s.tot_steps || 0}|${s.tot_unique_tok || 0}|${s.total_sessions || 0}` : '';
+      if (!s) return '';
+      const byP = tdata.by_provider || {};
+      const provSig = ['antigravity', 'codex'].map(p => {
+        const ps = byP[p] && byP[p].summary;
+        return ps ? `${p}:${ps.total_sessions || 0}:${ps.tot_unique_tok || 0}:${ps.tot_context_tok || 0}:${ps.tot_user_prompts || 0}` : p;
+      }).join(';');
+      return `${s.last_date || ''}|${s.tot_steps || 0}|${s.tot_unique_tok || 0}|${s.tot_context_tok || 0}|${s.tot_user_prompts || 0}|${s.total_sessions || 0}|${provSig}`;
     }
 
     async function fetchData(force = false) {
@@ -2575,16 +2586,58 @@ HTML_DASHBOARD_TEMPLATE = """
 
     let chartInstance = null;
     let tokenAnalyticsData = null;
+    let currentProvider = 'all'; // 'all' | 'antigravity' | 'codex'
     let currentGranularity = 'month'; // 'month' | 'week' | 'day'
     let currentPreset = 'all'; // 'all' | '12m' | '6m' | '3m' | '1m' | 'custom'
     let selectedFrom = '';
     let selectedTo = '';
 
+    function emptyAnalyticsSlice() {
+      return {
+        summary: {
+          total_sessions: 0,
+          active_days: 0,
+          first_date: '',
+          last_date: '',
+          tot_user_prompts: 0,
+          tot_model_calls: 0,
+          tot_model_tok: 0,
+          tot_thinking_tok: 0,
+          tot_tool_tok: 0,
+          tot_unique_tok: 0,
+          tot_context_tok: 0
+        },
+        monthly: [],
+        weekly: [],
+        daily: [],
+        top_conversations: []
+      };
+    }
+
+    function getActiveProviderData() {
+      if (!tokenAnalyticsData) return null;
+      if (currentProvider === 'all' || !tokenAnalyticsData.by_provider) {
+        return tokenAnalyticsData;
+      }
+      return tokenAnalyticsData.by_provider[currentProvider] || emptyAnalyticsSlice();
+    }
+
     function getCurrentDataset() {
-      if (!tokenAnalyticsData) return [];
-      if (currentGranularity === 'week') return tokenAnalyticsData.weekly || [];
-      if (currentGranularity === 'day') return tokenAnalyticsData.daily || [];
-      return tokenAnalyticsData.monthly || [];
+      const activeData = getActiveProviderData();
+      if (!activeData) return [];
+      if (currentGranularity === 'week') return activeData.weekly || [];
+      if (currentGranularity === 'day') return activeData.daily || [];
+      return activeData.monthly || [];
+    }
+
+    function setAnalyticsProvider(prov) {
+      if (currentProvider === prov) return;
+      currentProvider = prov;
+      ['all', 'antigravity', 'codex'].forEach(p => {
+        const btn = document.getElementById(`btn-prov-${p}`);
+        if (btn) btn.classList.toggle('active', p === prov);
+      });
+      renderActiveProviderView();
     }
 
     function renderTokenAnalytics(tdata) {
@@ -2592,23 +2645,57 @@ HTML_DASHBOARD_TEMPLATE = """
       tokenAnalyticsData = tdata;
       const section = document.getElementById('token-analytics-section');
       if (section) section.style.display = 'flex';
+      renderActiveProviderView();
+    }
 
-      const s = tdata.summary;
+    function renderActiveProviderView() {
+      const pdata = getActiveProviderData();
+      if (!pdata || !pdata.summary) return;
+
+      const subEl = document.getElementById('analytics-period-subtitle');
+      if (subEl) {
+        if (currentProvider === 'antigravity') {
+          subEl.innerText = 'Аналитика локальных сессий • ~/.gemini/antigravity/brain/';
+        } else if (currentProvider === 'codex') {
+          subEl.innerText = 'Аналитика локальных сессий • ~/.codex/sessions/';
+        } else {
+          subEl.innerText = 'Аналитика локальных сессий • Antigravity + Codex';
+        }
+      }
+
+      const s = pdata.summary;
       // Meta badges
       const sessEl = document.getElementById('meta-sessions-count');
       const daysEl = document.getElementById('meta-active-days');
       const rangeEl = document.getElementById('meta-period-range');
-      if (sessEl) sessEl.innerText = `${formatNumberFull(s.total_sessions)} сессий`;
-      if (daysEl) daysEl.innerText = `${s.active_days} активных дней`;
-      if (rangeEl) rangeEl.innerText = `${s.first_date || ''} — ${s.last_date || ''}`;
+      if (sessEl) sessEl.innerText = `${formatNumberFull(s.total_sessions || 0)} сессий`;
+      if (daysEl) daysEl.innerText = `${s.active_days || 0} активных дней`;
+      if (rangeEl) rangeEl.innerText = (s.first_date || s.last_date) ? `${s.first_date || ''} — ${s.last_date || ''}` : '-';
+
+      const byP = (currentProvider === 'all' && tokenAnalyticsData && tokenAnalyticsData.by_provider) ? tokenAnalyticsData.by_provider : null;
+      const agSum = byP && byP.antigravity && byP.antigravity.summary;
+      const cdxSum = byP && byP.codex && byP.codex.summary;
 
       // 1. KPI Cards
       const kpiGrid = document.getElementById('kpi-grid');
       if (kpiGrid) {
         const thinkingShare = s.tot_model_tok ? ((s.tot_thinking_tok / s.tot_model_tok) * 100).toFixed(1) : 0;
         const uPrompts = s.tot_user_prompts || 0;
-        const mCalls = s.tot_model_calls || 1;
+        const mCalls = s.tot_model_calls || 0;
         const globalMultiplier = uPrompts ? (mCalls / uPrompts).toFixed(1) : '-';
+
+        const promptsSub = (agSum && cdxSum)
+          ? `AGY: ${formatTokens(agSum.tot_user_prompts || 0)} · Codex: ${formatTokens(cdxSum.tot_user_prompts || 0)}`
+          : `${formatNumberFull(uPrompts)} прямых промптов`;
+        const callsSub = (agSum && cdxSum)
+          ? `x${globalMultiplier} · AGY: ${formatTokens(agSum.tot_model_calls || 0)} · Codex: ${formatTokens(cdxSum.tot_model_calls || 0)}`
+          : `Мультипликатор: x${globalMultiplier} к запросам`;
+        const uniqueSub = (agSum && cdxSum)
+          ? `AGY: ${formatTokens(agSum.tot_unique_tok || 0)} · Codex: ${formatTokens(cdxSum.tot_unique_tok || 0)}`
+          : `Суммарно: ${formatNumberFull(s.tot_unique_tok || 0)}`;
+        const contextSub = (agSum && cdxSum)
+          ? `AGY: ${formatTokens(agSum.tot_context_tok || 0)} · Codex: ${formatTokens(cdxSum.tot_context_tok || 0)}`
+          : `ReAct нагрузка (~O(N²))`;
 
         kpiGrid.innerHTML = `
           <div class="kpi-card">
@@ -2617,7 +2704,7 @@ HTML_DASHBOARD_TEMPLATE = """
               <span class="kpi-icon">⌨️</span>
             </div>
             <div class="kpi-val" style="color: #fb7185;">${formatTokens(uPrompts)}</div>
-            <div class="kpi-sub">${formatNumberFull(uPrompts)} прямых промптов</div>
+            <div class="kpi-sub">${promptsSub}</div>
           </div>
 
           <div class="kpi-card">
@@ -2626,7 +2713,7 @@ HTML_DASHBOARD_TEMPLATE = """
               <span class="kpi-icon">⚡</span>
             </div>
             <div class="kpi-val" style="color: #c084fc;">${formatTokens(mCalls)}</div>
-            <div class="kpi-sub">Мультипликатор: x${globalMultiplier} к запросам</div>
+            <div class="kpi-sub">${callsSub}</div>
           </div>
 
           <div class="kpi-card">
@@ -2634,8 +2721,8 @@ HTML_DASHBOARD_TEMPLATE = """
               <span>Ответы модели</span>
               <span class="kpi-icon">💬</span>
             </div>
-            <div class="kpi-val" style="color: #34d399;">${formatTokens(s.tot_model_tok)}</div>
-            <div class="kpi-sub">${formatNumberFull(s.tot_model_tok)} токенов</div>
+            <div class="kpi-val" style="color: #34d399;">${formatTokens(s.tot_model_tok || 0)}</div>
+            <div class="kpi-sub">${formatNumberFull(s.tot_model_tok || 0)} токенов</div>
           </div>
 
           <div class="kpi-card">
@@ -2643,7 +2730,7 @@ HTML_DASHBOARD_TEMPLATE = """
               <span>Рассуждения (CoT)</span>
               <span class="kpi-icon">🧠</span>
             </div>
-            <div class="kpi-val" style="color: #fbbf24;">${formatTokens(s.tot_thinking_tok)}</div>
+            <div class="kpi-val" style="color: #fbbf24;">${formatTokens(s.tot_thinking_tok || 0)}</div>
             <div class="kpi-sub">${thinkingShare}% от ответов модели</div>
           </div>
 
@@ -2652,8 +2739,8 @@ HTML_DASHBOARD_TEMPLATE = """
               <span>Данные Tools</span>
               <span class="kpi-icon">🛠️</span>
             </div>
-            <div class="kpi-val" style="color: #818cf8;">${formatTokens(s.tot_tool_tok)}</div>
-            <div class="kpi-sub">${formatNumberFull(s.tot_tool_tok)} токенов</div>
+            <div class="kpi-val" style="color: #818cf8;">${formatTokens(s.tot_tool_tok || 0)}</div>
+            <div class="kpi-sub">${formatNumberFull(s.tot_tool_tok || 0)} токенов</div>
           </div>
 
           <div class="kpi-card">
@@ -2661,8 +2748,8 @@ HTML_DASHBOARD_TEMPLATE = """
               <span>Уникальных токенов</span>
               <span class="kpi-icon">💎</span>
             </div>
-            <div class="kpi-val" style="color: #38bdf8;">${formatTokens(s.tot_unique_tok)}</div>
-            <div class="kpi-sub">Суммарно: ${formatNumberFull(s.tot_unique_tok)}</div>
+            <div class="kpi-val" style="color: #38bdf8;">${formatTokens(s.tot_unique_tok || 0)}</div>
+            <div class="kpi-sub">${uniqueSub}</div>
           </div>
 
           <div class="kpi-card">
@@ -2670,8 +2757,8 @@ HTML_DASHBOARD_TEMPLATE = """
               <span>Кумулятивный контекст</span>
               <span class="kpi-icon">🌀</span>
             </div>
-            <div class="kpi-val" style="color: #f87171;">${formatTokens(s.tot_context_tok)}</div>
-            <div class="kpi-sub">ReAct нагрузка (~O(N²))</div>
+            <div class="kpi-val" style="color: #f87171;">${formatTokens(s.tot_context_tok || 0)}</div>
+            <div class="kpi-sub">${contextSub}</div>
           </div>
         `;
       }
@@ -2680,7 +2767,7 @@ HTML_DASHBOARD_TEMPLATE = """
       initDateRangeFilter();
 
       // 3. Render Top Sessions
-      renderTopSessions(tdata.top_conversations || []);
+      renderTopSessions(pdata.top_conversations || []);
     }
 
     function initDateRangeFilter() {
@@ -2693,7 +2780,14 @@ HTML_DASHBOARD_TEMPLATE = """
       const items = getCurrentDataset();
       const fromSel = document.getElementById('select-date-from');
       const toSel = document.getElementById('select-date-to');
-      if (!fromSel || !toSel || !items.length) return;
+      if (!fromSel || !toSel) return;
+      if (!items.length) {
+        fromSel.innerHTML = '';
+        toSel.innerHTML = '';
+        selectedFrom = '';
+        selectedTo = '';
+        return;
+      }
 
       const periods = items.map(m => m.period);
       fromSel.innerHTML = periods.map(p => `<option value="${p}">${p}</option>`).join('');
@@ -3160,6 +3254,10 @@ HTML_DASHBOARD_TEMPLATE = """
 
       tbody.innerHTML = displayItems.map(c => {
         const shortId = (c.id || '').substring(0, 8) + '...';
+        const isCodex = c.provider === 'codex';
+        const provBadge = isCodex
+          ? `<span style="display:inline-block;padding:1px 6px;border-radius:5px;font-size:10px;font-weight:700;background:rgba(16,185,129,0.16);color:#34d399;border:1px solid rgba(16,185,129,0.35);margin-right:6px;">Codex</span>`
+          : `<span style="display:inline-block;padding:1px 6px;border-radius:5px;font-size:10px;font-weight:700;background:rgba(99,102,241,0.16);color:#a5b4fc;border:1px solid rgba(99,102,241,0.35);margin-right:6px;">AGY</span>`;
         const displayTitle = (c.title || c.first_req || 'Диалог без темы').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         const cleanPrompt = (c.first_req || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         const rawProj = (c.project && c.project !== '—') ? c.project.replace(/</g, '&lt;').replace(/>/g, '&gt;') : '';
@@ -3175,7 +3273,7 @@ HTML_DASHBOARD_TEMPLATE = """
           <tr>
             <td class="topic-cell" title="ID: ${c.id}&#10;Тема: ${displayTitle}&#10;Стартовый запрос: ${cleanPrompt}">
               <div class="topic-title">${displayTitle}</div>
-              <div class="topic-id">ID: ${shortId}</div>
+              <div class="topic-id">${provBadge}ID: ${shortId}</div>
             </td>
             <td>${projectBadge}</td>
             <td>${statusBadge}</td>
